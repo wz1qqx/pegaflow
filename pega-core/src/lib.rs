@@ -1,14 +1,11 @@
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicUsize, Ordering},
-    sync::Arc,
 };
 
-use cudarc::driver::CudaContext;
 use tracing::{debug, info, instrument};
 
 pub struct PegaEngine {
-    context: Arc<CudaContext>,
     /// Store registered KV cache pointers (new IPC wrapper): layer_name -> registration
     kv_caches: HashMap<String, KVCacheRegistration>,
     /// Store saved KV blocks: (layer_name, block_hash) -> block data
@@ -45,9 +42,6 @@ impl PegaEngine {
     pub fn new() -> Self {
         use cudarc::driver::sys;
 
-        // default device is 0
-        let context = cudarc::driver::CudaContext::new(0).unwrap();
-
         // Allocate 10GB pinned memory pool
         let pool_size = 10 * 1024 * 1024 * 1024; // 10GB
         let mut pool_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -66,7 +60,6 @@ impl PegaEngine {
         );
 
         PegaEngine {
-            context,
             kv_caches: HashMap::new(),
             kv_storage: HashMap::new(),
             pinned_pool_ptr: pool_ptr as *mut u8,
