@@ -70,9 +70,8 @@ def main():
     # Initialize vLLM with GPT-2
     print("\n[1/4] Loading model...")
     llm = LLM(
-        model="/home/sjy/.cache/modelscope/hub/models/Qwen/Qwen3-8B",
+        model="gpt2",
         trust_remote_code=True,
-        max_model_len=8096,
         enforce_eager=True,
         enable_prefix_caching=False,  # Disable vLLM's internal prefix cache
         kv_transfer_config=kv_transfer_config,
@@ -80,7 +79,7 @@ def main():
     print("✓ Model loaded successfully!")
 
     # Test prompt - use the same prompt twice
-    prompt = real_long_prompt()
+    prompt = "Hello, how are u today? I'm fine, thank you. And you?"
 
     # Sampling parameters - use temperature=0 for deterministic output
     sampling_params = SamplingParams(

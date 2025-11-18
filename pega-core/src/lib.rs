@@ -1,86 +1,153 @@
 use std::{collections::HashMap, sync::Arc};
 
 use cudarc::driver::CudaContext;
+use tracing::{debug, info, instrument};
 
 pub struct PegaEngine {
     context: Arc<CudaContext>,
-    /// Store registered KV cache pointers (new IPC wrapper): layer_name -> KVCachePtr
-    kv_cache_ptrs: HashMap<String, KVCachePtr>,
-    /// Store saved KV blocks: (layer_name, block_hash) -> block_data
-    kv_storage: HashMap<(String, Vec<u8>), Vec<u8>>,
+    /// Store registered KV cache pointers (new IPC wrapper): layer_name -> registration
+    kv_caches: HashMap<String, KVCacheRegistration>,
+    /// Store saved KV blocks: (layer_name, block_hash) -> block data
+    kv_storage: HashMap<(String, Vec<u8>), Block>,
 }
 
-/// Represents a CUDA IPC handle for a KV cache tensor (legacy)
 #[derive(Debug, Clone)]
-pub struct KVCacheHandle {
-    pub device: i32,
-    pub ipc_handle: Vec<u8>,
-    pub size: usize,
-    pub offset: usize,
-    pub ipc_event_handle: Vec<u8>,
-}
-
-/// Represents a GPU memory pointer for a KV cache tensor (new IPC wrapper method)
-#[derive(Debug, Clone)]
-pub struct KVCachePtr {
+pub struct KVCacheRegistration {
     pub data_ptr: u64,
     pub size_bytes: usize,
+    pub num_blocks: usize,
+    pub bytes_per_block: usize,
+}
+
+#[derive(Clone)]
+pub struct Block {
+    pub data: Vec<u8>,
 }
 
 impl PegaEngine {
     /// Create a new PegaEngine instance
+    #[instrument(level = "info")]
     pub fn new() -> Self {
         // default device is 0
         let context = cudarc::driver::CudaContext::new(0).unwrap();
         PegaEngine {
             context,
-            kv_cache_ptrs: HashMap::new(),
+            kv_caches: HashMap::new(),
             kv_storage: HashMap::new(),
         }
     }
 
-    /// Register a KV cache by GPU pointer (new IPC wrapper method)
-    ///
-    /// This method stores the GPU pointer that was reconstructed from an IPC handle
-    /// in Python. The pointer can be used directly for GPU memory operations.
-    ///
-    /// Args:
-    ///   - layer_name: Name of the layer
-    ///   - data_ptr: GPU data pointer
-    ///   - size_bytes: Size of the tensor in bytes
-    pub fn register_kv_cache_ptr(&mut self, layer_name: String, data_ptr: u64, size_bytes: usize) {
-        let cache_ptr = KVCachePtr {
+    /// Register a KV cache region with its layout info
+    #[instrument(
+        level = "info",
+        skip(self),
+        fields(layer = %layer_name, size_bytes, num_blocks, bytes_per_block)
+    )]
+    pub fn register_kv_cache(
+        &mut self,
+        layer_name: String,
+        data_ptr: u64,
+        size_bytes: usize,
+        num_blocks: usize,
+        bytes_per_block: usize,
+    ) {
+        if bytes_per_block == 0 || num_blocks == 0 {
+            panic!("Invalid KV cache layout for layer {}", layer_name);
+        }
+
+        let registration = KVCacheRegistration {
             data_ptr,
             size_bytes,
+            num_blocks,
+            bytes_per_block,
         };
 
-        self.kv_cache_ptrs.insert(layer_name, cache_ptr);
+        self.kv_caches.insert(layer_name, registration);
     }
 
     /// Unregister all KV cache handles
+    #[instrument(level = "info", skip(self))]
     pub fn unregister_all_kv_caches(&mut self) {
-        self.kv_cache_ptrs.clear();
+        self.kv_caches.clear();
     }
 
     /// Get the number of registered KV caches
+    #[instrument(level = "debug", skip(self), ret)]
     pub fn num_registered_kv_caches(&self) -> usize {
-        println!("self.kv_cache_handles.len() = {}", self.kv_cache_ptrs.len());
-        self.kv_cache_ptrs.len()
+        self.kv_caches.len()
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self, block_ids, block_hashes),
+        fields(layer = %layer_name, blocks = %block_ids.len(), hashes = %block_hashes.len()),
+        err
+    )]
     pub fn save_kv_blocks_from_ipc(
         &mut self,
-        _layer_name: String,
-        _block_ids: Vec<i32>,
-        _block_hashes: Vec<Vec<u8>>,
+        layer_name: String,
+        block_ids: Vec<i32>,
+        block_hashes: Vec<Vec<u8>>,
     ) -> Result<(), String> {
+        if block_ids.len() != block_hashes.len() {
+            return Err("block_ids and block_hashes must have equal length".into());
+        }
+
+        let Some(registration) = self.kv_caches.get(&layer_name) else {
+            return Err(format!("Layer {} not registered", layer_name));
+        };
+
+        for (block_id, block_hash) in block_ids.into_iter().zip(block_hashes.into_iter()) {
+            if block_id < 0 {
+                continue;
+            }
+            let block_idx = block_id as usize;
+            if block_idx >= registration.num_blocks {
+                return Err(format!(
+                    "Block {} out of range for layer {} ({} blocks registered)",
+                    block_idx, layer_name, registration.num_blocks
+                ));
+            }
+
+            let offset = block_idx
+                .checked_mul(registration.bytes_per_block)
+                .ok_or_else(|| "Block offset overflow".to_string())?;
+
+            if offset + registration.bytes_per_block > registration.size_bytes {
+                return Err(format!(
+                    "Block {} exceeds registered memory for layer {}",
+                    block_idx, layer_name
+                ));
+            }
+
+            let mut buffer = vec![0u8; registration.bytes_per_block];
+            self.copy_gpu_to_cpu(
+                registration.data_ptr,
+                offset,
+                &mut buffer,
+                registration.bytes_per_block,
+            )?;
+
+            if self
+                .kv_storage
+                .contains_key(&(layer_name.clone(), block_hash.clone()))
+            {
+                continue;
+            }
+
+            info!("insert key {}-{:?} to kv_storage", layer_name, block_hash);
+
+            self.kv_storage
+                .insert((layer_name.clone(), block_hash), Block { data: buffer });
+        }
+
         Ok(())
     }
 
     /// Copy data from GPU to CPU
+    #[instrument(level = "debug", skip(self, cpu_buffer), fields(offset, size), err)]
     fn copy_gpu_to_cpu(
         &self,
-        _stream: &cudarc::driver::CudaStream,
         gpu_base_ptr: u64,
         offset: usize,
         cpu_buffer: &mut [u8],
@@ -104,9 +171,10 @@ impl PegaEngine {
 
     /// Get storage statistics
     /// Returns (num_blocks, total_bytes)
+    #[instrument(level = "info", skip(self), ret)]
     pub fn get_storage_stats(&self) -> (usize, usize) {
         let num_blocks = self.kv_storage.len();
-        let total_bytes: usize = self.kv_storage.values().map(|v| v.len()).sum();
+        let total_bytes: usize = self.kv_storage.values().map(|block| block.data.len()).sum();
         (num_blocks, total_bytes)
     }
 
@@ -118,15 +186,17 @@ impl PegaEngine {
     ///
     /// Returns:
     ///   - Vec<bool>: For each hash, true if available in storage
+    #[instrument(
+        level = "info",
+        skip(self, block_hashes),
+        fields(layer = %layer_name, requested = %block_hashes.len()),
+        ret
+    )]
     pub fn check_kv_blocks_availability(
         &self,
         layer_name: String,
         block_hashes: Vec<Vec<u8>>,
     ) -> Vec<bool> {
-        println!("\n=== Rust: check_kv_blocks_availability ===");
-        println!("Layer: {}", layer_name);
-        println!("Checking {} block hashes", block_hashes.len());
-
         let mut availability = Vec::with_capacity(block_hashes.len());
 
         for (idx, block_hash) in block_hashes.iter().enumerate() {
@@ -134,26 +204,20 @@ impl PegaEngine {
             let available = self.kv_storage.contains_key(&key);
             availability.push(available);
 
-            if available {
-                println!(
-                    "  Block {} (hash {:?}): AVAILABLE",
-                    idx,
-                    &block_hash[..8.min(block_hash.len())]
-                );
-            } else {
-                println!(
-                    "  Block {} (hash {:?}): NOT FOUND",
-                    idx,
-                    &block_hash[..8.min(block_hash.len())]
-                );
-            }
+            let hash_preview: Vec<u8> = block_hash.iter().copied().take(8).collect();
+            debug!(
+                block_index = idx,
+                available,
+                hash_prefix = ?hash_preview,
+                "Checked KV block availability"
+            );
         }
 
         let num_available = availability.iter().filter(|&&x| x).count();
-        println!(
-            "=== Result: {}/{} blocks available ===\n",
+        debug!(
             num_available,
-            block_hashes.len()
+            total = block_hashes.len(),
+            "Completed KV block availability check"
         );
 
         availability
@@ -165,19 +229,80 @@ impl PegaEngine {
     ///   - layer_name: Name of the layer
     ///   - block_ids: GPU block IDs to load into
     ///   - block_hashes: Content hashes for each block
+    #[instrument(
+        level = "info",
+        skip(self, block_ids, block_hashes),
+        fields(layer = %layer_name, blocks = %block_ids.len(), hashes = %block_hashes.len()),
+        err
+    )]
     pub fn load_kv_blocks_to_ipc(
         &self,
         layer_name: String,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
     ) -> Result<(), String> {
+        if block_ids.len() != block_hashes.len() {
+            return Err("block_ids and block_hashes must have equal length".into());
+        }
+
+        let Some(registration) = self.kv_caches.get(&layer_name) else {
+            return Err(format!("Layer {} not registered", layer_name));
+        };
+
+        for (block_id, block_hash) in block_ids.into_iter().zip(block_hashes.into_iter()) {
+            if block_id < 0 {
+                continue;
+            }
+
+            let block_idx = block_id as usize;
+            if block_idx >= registration.num_blocks {
+                return Err(format!(
+                    "Block {} out of range for layer {} ({} blocks registered)",
+                    block_idx, layer_name, registration.num_blocks
+                ));
+            }
+
+            let key = (layer_name.clone(), block_hash.clone());
+            info!("load key {}-{:?} from kv_storage", layer_name, block_hash);
+            let Some(block) = self.kv_storage.get(&key) else {
+                return Err(format!("Missing KV block for layer {}", layer_name));
+            };
+
+            if block.data.len() != registration.bytes_per_block {
+                return Err(format!(
+                    "Stored block size mismatch for layer {}: {} vs {}",
+                    layer_name,
+                    block.data.len(),
+                    registration.bytes_per_block
+                ));
+            }
+
+            let offset = block_idx
+                .checked_mul(registration.bytes_per_block)
+                .ok_or_else(|| "Block offset overflow".to_string())?;
+
+            if offset + registration.bytes_per_block > registration.size_bytes {
+                return Err(format!(
+                    "Block {} exceeds registered memory for layer {}",
+                    block_idx, layer_name
+                ));
+            }
+
+            self.copy_cpu_to_gpu(
+                registration.data_ptr,
+                offset,
+                &block.data,
+                registration.bytes_per_block,
+            )?;
+        }
+
         Ok(())
     }
 
     /// Copy data from CPU to GPU
+    #[instrument(level = "debug", skip(self, cpu_buffer), fields(offset, size), err)]
     fn copy_cpu_to_gpu(
         &self,
-        _stream: &cudarc::driver::CudaStream,
         gpu_base_ptr: u64,
         offset: usize,
         cpu_buffer: &[u8],

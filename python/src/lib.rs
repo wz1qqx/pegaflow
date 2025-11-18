@@ -1,6 +1,29 @@
+use std::sync::Once;
+
 use pega_core::PegaEngine as CoreEngine;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use tracing_subscriber::{
+    fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
+};
+
+static INIT_TRACING: Once = Once::new();
+
+fn init_tracing() {
+    INIT_TRACING.call_once(|| {
+        // Default to info for most crates, debug for core if RUST_LOG not set.
+        let env_filter = EnvFilter::try_from_default_env()
+            .or_else(|_| "info,pega_core=info".parse())
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+
+        let fmt_layer = tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE);
+
+        // Ignore errors if already initialized by embedding app.
+        let _ = tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(env_filter)
+            .try_init();
+    });
+}
 
 /// Python wrapper for PegaEngine
 #[pyclass]
@@ -13,24 +36,35 @@ impl PegaEngine {
     /// Create a new PegaEngine instance
     #[new]
     fn new() -> Self {
+        init_tracing();
         PegaEngine {
             engine: CoreEngine::new(),
         }
     }
 
-    /// Register a KV cache by GPU pointer (new IPC wrapper method)
-    ///
-    /// This method receives a GPU pointer that was reconstructed from an IPC handle
-    /// in Python. The Python side handles the IPC serialization/deserialization and
-    /// tensor reconstruction, then passes the GPU pointer to Rust.
+    /// Register a KV cache buffer along with its layout metadata.
     ///
     /// Args:
     ///     layer_name: Name of the layer
     ///     data_ptr: GPU data pointer (as u64)
-    ///     size_bytes: Size of the tensor in bytes
-    fn register_kv_cache_ptr(&mut self, layer_name: String, data_ptr: u64, size_bytes: usize) {
-        self.engine
-            .register_kv_cache_ptr(layer_name, data_ptr, size_bytes);
+    ///     size_bytes: Total size of the tensor in bytes
+    ///     num_blocks: Total number of paged blocks for this layer
+    ///     bytes_per_block: Size of each paged block in bytes
+    fn register_kv_cache(
+        &mut self,
+        layer_name: String,
+        data_ptr: u64,
+        size_bytes: usize,
+        num_blocks: usize,
+        bytes_per_block: usize,
+    ) {
+        self.engine.register_kv_cache(
+            layer_name,
+            data_ptr,
+            size_bytes,
+            num_blocks,
+            bytes_per_block,
+        );
     }
 
     /// Unregister all KV cache handles
@@ -105,6 +139,7 @@ impl PegaEngine {
 /// This module is named "pegaflow" and will be imported as: from pegaflow import PegaEngine
 #[pymodule]
 fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    init_tracing();
     m.add_class::<PegaEngine>()?;
     Ok(())
 }

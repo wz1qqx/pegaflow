@@ -10,4 +10,4 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
 pega-core = { path = "../pega-core" }
-
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

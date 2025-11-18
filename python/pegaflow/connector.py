@@ -20,9 +20,13 @@ Later we can register this class as a dynamic connector in vLLM by
 referencing it via its full import path.
 """
 
-from typing import Any, Optional, Tuple, Dict, List
-import torch
+import os
 import pickle
+import threading
+from typing import Any, Optional, Tuple, Dict, List
+
+import torch
+import zmq
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -33,39 +37,28 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 # Import the Rust PegaEngine
 from pegaflow.pegaflow import PegaEngine
 
-# Import IPC wrapper for cross-process GPU memory sharing
-from pegaflow.ipc_wrapper import CudaIPCWrapper
+_LOOKUP_ENDPOINT = os.environ.get("PEGAFLOW_KV_LOOKUP_ENDPOINT")
+if _LOOKUP_ENDPOINT is None:
+    unique_id = getattr(os, "getuid", os.getpid)()
+    _LOOKUP_ENDPOINT = f"ipc:///tmp/pegaflow_kv_lookup_{unique_id}.sock"
+
 
 class PegaConnectorMetadata(KVConnectorMetadata):
     """Metadata for PegaFlow KV connector.
 
     Contains information needed to save/load KV cache blocks:
-    - block_tables: mapping from sequence to block IDs
     - block_hashes: content hashes for each block
-    - seq_lens: length of each sequence
     - requests_to_load: mapping from request ID to load information
     """
 
     def __init__(
         self,
-        block_tables: Optional[Dict[str, List[int]]] = None,
         block_hashes: Optional[Dict[str, List[bytes]]] = None,
-        seq_lens: Optional[Dict[str, int]] = None,
         requests_to_load: Optional[Dict[str, Dict]] = None,
     ):
         super().__init__()
-        self.block_tables = block_tables or {}
         self.block_hashes = block_hashes or {}
-        self.seq_lens = seq_lens or {}
         self.requests_to_load = requests_to_load or {}
-
-def print_handle(handle):
-    device = handle[0]
-    ipc_handle = handle[1]
-    size = handle[2]
-    offset = handle[3]
-    ipc_event_handle = handle[6]
-    print(f"device: {device}, ipc_handle: {ipc_handle}, size: {size}, offset: {offset}, ipc_event_handle: {ipc_event_handle}")
 
 class PegaKVConnector(KVConnectorBase_V1):
     """Skeleton v1 KV connector for PegaFlow.
@@ -88,8 +81,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         # Initialize PegaEngine for managing KV cache handles
         self.engine = PegaEngine()
 
-        # Track block tables and hashes for each request across steps
-        self._request_block_tables = {}  # req_id -> list[int]
+        # Track block hashes for each request across steps
         self._request_block_hashes = {}  # req_id -> list[bytes]
 
         # Track pending save operations
@@ -98,12 +90,28 @@ class PegaKVConnector(KVConnectorBase_V1):
         # Track requests that need to load KV cache from CPU
         self._requests_to_load = {}  # req_id -> dict with load info
 
-        # Track which prompts have been saved (use first 10 tokens as key)
-        # This is a simple workaround for process isolation
-        self._saved_prompts = set()  # set of tuples: (token1, token2, ..., token10)
+        # Track registered KV cache layers
+        self._registered_layers: list[str] = []
+
+        # Scheduler/worker lookup channel state
+        self._lookup_endpoint = _LOOKUP_ENDPOINT
+        self._lookup_context: Optional[zmq.Context] = None
+        self._lookup_server_socket = None
+        self._lookup_server_thread: Optional[threading.Thread] = None
+        self._lookup_stop_event = threading.Event()
+        self._lookup_client = None
 
         # Get block size from vllm_config
         self._block_size = vllm_config.cache_config.block_size
+        # NOTE: KV cache layout is detected in register_kv_caches() by checking tensor shape.
+        # vLLM uses KV-first layout: (2, num_blocks, block_size, num_heads, head_dim)
+        # where the first dimension (2) represents K and V separately.
+
+        # Only worker rank 0 needs to host the lookup server
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        data_parallel_rank = getattr(parallel_config, "data_parallel_rank", 0)
+        if role == KVConnectorRole.WORKER and data_parallel_rank == 0:
+            self._start_lookup_server()
 
     # ==============================
     # Worker-side methods
@@ -219,9 +227,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         # Store for later processing in wait_for_save
         self._pending_saves.append({
             'layer_name': layer_name,
-            'kv_layer': kv_layer,
             'attn_metadata': attn_metadata,
-            'kwargs': kwargs
         })
 
     def wait_for_save(self) -> None:
@@ -275,7 +281,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                     # Calculate number of blocks needed for this sequence
                     if seq_lens is not None:
                         seq_len = seq_lens[seq_idx].item()
-                        num_blocks = (seq_len + 15) // 16  # Round up to block size
+                        num_blocks = (seq_len + self._block_size - 1) // self._block_size
                     else:
                         # Fallback: count non-zero blocks
                         num_blocks = (block_table[seq_idx] != 0).sum().item()
@@ -291,8 +297,10 @@ class PegaKVConnector(KVConnectorBase_V1):
                     block_hashes_for_seq = None
                     matched_req_id = None
                     for req_id, hashes in metadata.block_hashes.items():
-                        if len(hashes) >= num_blocks:
-                            block_hashes_for_seq = hashes[:num_blocks]
+                        if len(hashes) > 0:
+                            num_use = min(num_blocks, len(hashes))
+                            block_hashes_for_seq = hashes[:num_use]
+                            active_blocks = active_blocks[:num_use]
                             matched_req_id = req_id
                             break
 
@@ -306,7 +314,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                             active_blocks,
                             block_hashes_for_seq
                         )
-                        total_blocks_saved += num_blocks
+                        total_blocks_saved += len(block_hashes_for_seq)
                     except Exception:
                         # Silently skip failed saves
                         pass
@@ -361,53 +369,38 @@ class PegaKVConnector(KVConnectorBase_V1):
             connectivity issues or eviction), those tokens must not be taken
             into account.
         """
-        import hashlib
-        # Get prompt tokens
         prompt_token_ids = request.prompt_token_ids or []
         if len(prompt_token_ids) == 0:
             return (0, False)
 
         req_id = request.request_id
-
-        # Calculate number of blocks needed for the prompt
         num_tokens = len(prompt_token_ids)
-        num_blocks = (num_tokens + self._block_size - 1) // self._block_size
 
-        if num_blocks == 0:
-            print(f"return 0 since num blocks is 0")
+        block_hashes = list(getattr(request, "block_hashes", []) or [])
+        if len(block_hashes) == 0:
+            print(f"[PegaKVConnector] Request {req_id}: No full block hashes available yet")
             return (0, False)
 
-        # Generate block hashes (same logic as in build_connector_meta)
-        block_hashes = []
-        for block_idx in range(num_blocks):
-            hash_input = f"{req_id}_block_{block_idx}".encode('utf-8')
-            block_hash = hashlib.sha256(hash_input).digest()
-            block_hashes.append(block_hash)
-
-        # SIMPLIFIED LOGIC: Use first 10 tokens as a fingerprint to check if we've seen this prompt
-        # 1. First run: prompt not in _saved_prompts -> return 0
-        # 2. Second run: prompt in _saved_prompts -> return all tokens beyond num_computed_tokens
-        #    BUT: Must leave at least 1 token for GPU to compute (to generate logits)
-
-        # Create prompt fingerprint from first 10 tokens
-        prompt_fingerprint = tuple(prompt_token_ids[:10])
-
-        # Check if this prompt has been saved before
-        if prompt_fingerprint not in self._saved_prompts:
-            print(f"[PegaKVConnector] Request {req_id}: First time seeing this prompt, no cache available")
+        matched_blocks = self._send_lookup_request(req_id, block_hashes)
+        if matched_blocks <= 0:
+            print(f"[PegaKVConnector] Request {req_id}: No cached blocks reported by worker")
             return (0, False)
 
-        # Prompt was saved before - assume ALL prompt tokens are cached
-        # Calculate how many tokens beyond num_computed_tokens can be loaded
-        # IMPORTANT: Must leave at least 1 token for GPU to compute (vLLM requirement)
-        max_cacheable_tokens = num_tokens - 1  # Leave last token for GPU
+        available_tokens = min(matched_blocks * self._block_size, num_tokens)
+        if available_tokens <= 1:
+            return (0, False)
+
+        max_cacheable_tokens = available_tokens - 1  # Leave last token for GPU
         num_new_tokens = max_cacheable_tokens - num_computed_tokens
 
         if num_new_tokens <= 0:
-            print(f"[PegaKVConnector] Request {req_id}: All cacheable tokens already computed")
+            print(f"[PegaKVConnector] Request {req_id}: All available cached tokens already consumed")
             return (0, False)
 
-        print(f"[PegaKVConnector] Request {req_id}: Prompt seen before! Can load {num_new_tokens} tokens from cache (total: {num_tokens}, computed: {num_computed_tokens}, leaving 1 for GPU)")
+        print(
+            f"[PegaKVConnector] Request {req_id}: Worker reports {matched_blocks} cached blocks "
+            f"({available_tokens} tokens), scheduler can reuse {num_new_tokens} tokens"
+        )
         return (num_new_tokens, False)
 
     def update_state_after_alloc(
@@ -431,9 +424,18 @@ class PegaKVConnector(KVConnectorBase_V1):
             num_external_tokens (int): the number of tokens that will be
                 loaded from the external KV cache.
         """
+        req_id = request.request_id
+
+        # block hashes is  a list[bytes]
+        self._request_block_hashes[req_id] = request.block_hashes
+        for block_hash in request.block_hashes:
+            print(f"block hash: {block_hash}")
+        print(f"[PegaKVConnector] Saved {len(request.block_hashes)} block hashes for request {req_id}")
+
+            
+
         # If there are external tokens to load, record this request
         if num_external_tokens > 0:
-            req_id = request.request_id
             print(f"[PegaKVConnector] Recording request {req_id} for loading {num_external_tokens} tokens")
 
             self._requests_to_load[req_id] = {
@@ -452,11 +454,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
-        import hashlib
-
-        block_tables = {}
         block_hashes = {}
-        seq_lens = {}
 
         # ============================================================
         # STEP 1: Process new requests (first time scheduled)
@@ -465,77 +463,25 @@ class PegaKVConnector(KVConnectorBase_V1):
         for req in new_reqs:
             req_id = req.req_id
 
-            # Extract block table from first KV cache group
-            # block_ids is tuple[list[int], ...] for different KV cache groups
-            block_table = list(req.block_ids[0]) if req.block_ids else []
-
-            # Store block table in metadata and persistent state
-            if block_table:
-                block_tables[req_id] = block_table
-                self._request_block_tables[req_id] = block_table.copy()
-
-            # Store sequence length
-            seq_lens[req_id] = req.num_computed_tokens
-
-            # Generate block hashes for each block
-            if block_table:
-                hashes = []
-                for block_idx in range(len(block_table)):
-                    hash_input = f"{req_id}_block_{block_idx}".encode('utf-8')
-                    block_hash = hashlib.sha256(hash_input).digest()
-                    hashes.append(block_hash)
-
-                block_hashes[req_id] = hashes
-                self._request_block_hashes[req_id] = hashes.copy()
-
-            # Record prompt fingerprint (first 10 tokens) for cache hit detection
-            if req.prompt_token_ids and len(req.prompt_token_ids) > 0:
-                prompt_fingerprint = tuple(req.prompt_token_ids[:10])
-                self._saved_prompts.add(prompt_fingerprint)
-                print(f"[PegaKVConnector] Recorded prompt fingerprint for request {req_id}: {prompt_fingerprint[:3]}...")
+            # Use block hashes saved from update_state_after_alloc()
+            # These are vLLM's content-based hashes computed from token sequences
+            if req_id in self._request_block_hashes:
+                saved_hashes = self._request_block_hashes[req_id]
+                block_hashes[req_id] = saved_hashes
+                print(f"[PegaKVConnector] Using {len(saved_hashes)} content-based block hashes for request {req_id}")
 
         # ============================================================
         # STEP 2: Process cached requests (already scheduled, now in decode phase)
         # ============================================================
+        # Note: For cached requests, block_hashes are already updated in
+        # update_state_after_alloc() when new blocks are allocated during decode.
+        # We just need to retrieve them from our persistent state.
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached_reqs.req_ids):
-            # Retrieve existing block table from persistent state
-            block_table = self._request_block_tables.get(req_id, []).copy()
-
-            # Append new blocks if any
-            if i < len(cached_reqs.new_block_ids):
-                new_blocks = cached_reqs.new_block_ids[i]
-                if new_blocks is not None:
-                    # new_blocks is tuple[list[int], ...] for different KV cache groups
-                    new_block_list = list(new_blocks[0]) if new_blocks else []
-                    if new_block_list:
-                        block_table.extend(new_block_list)
-                        self._request_block_tables[req_id] = block_table.copy()
-
-            # Store block table in metadata
-            if block_table:
-                block_tables[req_id] = block_table
-
-            # Store sequence length
-            if i < len(cached_reqs.num_computed_tokens):
-                seq_lens[req_id] = cached_reqs.num_computed_tokens[i]
-
-            # Generate hashes for any new blocks
-            if block_table:
-                existing_hashes = self._request_block_hashes.get(req_id, []).copy()
-                num_existing = len(existing_hashes)
-                num_total = len(block_table)
-
-                # Generate hashes for blocks that don't have hashes yet
-                if num_total > num_existing:
-                    for block_idx in range(num_existing, num_total):
-                        hash_input = f"{req_id}_block_{block_idx}".encode('utf-8')
-                        block_hash = hashlib.sha256(hash_input).digest()
-                        existing_hashes.append(block_hash)
-
-                    self._request_block_hashes[req_id] = existing_hashes.copy()
-
-                block_hashes[req_id] = existing_hashes
+            # Use block hashes from persistent state (updated by update_state_after_alloc)
+            if req_id in self._request_block_hashes:
+                saved_hashes = self._request_block_hashes[req_id]
+                block_hashes[req_id] = saved_hashes
 
         # ============================================================
         # STEP 3: Process requests that need to load from CPU storage
@@ -543,7 +489,6 @@ class PegaKVConnector(KVConnectorBase_V1):
         requests_to_load = {}
 
         for req_id, load_info in self._requests_to_load.items():
-            request = load_info['request']
             num_external_tokens = load_info['num_external_tokens']
 
             # Find this request in scheduler_output
@@ -553,16 +498,13 @@ class PegaKVConnector(KVConnectorBase_V1):
                     # Extract block IDs from the request
                     block_ids = list(req.block_ids[0]) if req.block_ids else []
 
-                    # Calculate number of blocks needed
+                    # Calculate number of blocks needed, clamp to available hashes
                     num_blocks = (num_external_tokens + self._block_size - 1) // self._block_size
+                    saved_hashes = self._request_block_hashes.get(req_id, [])
+                    num_blocks = min(num_blocks, len(saved_hashes))
 
                     if num_blocks > 0 and len(block_ids) >= num_blocks:
-                        # Generate block hashes for the blocks to load
-                        load_hashes = []
-                        for block_idx in range(num_blocks):
-                            hash_input = f"{req_id}_block_{block_idx}".encode('utf-8')
-                            block_hash = hashlib.sha256(hash_input).digest()
-                            load_hashes.append(block_hash)
+                        load_hashes = saved_hashes[:num_blocks]
 
                         # Store load information
                         requests_to_load[req_id] = {
@@ -586,43 +528,215 @@ class PegaKVConnector(KVConnectorBase_V1):
         # STEP 4: Build and return metadata
         # ============================================================
         metadata = PegaConnectorMetadata(
-            block_tables=block_tables,
             block_hashes=block_hashes,
-            seq_lens=seq_lens,
             requests_to_load=requests_to_load,
         )
 
         return metadata
+
+    def _start_lookup_server(self) -> None:
+        """Start background REP server for scheduler lookup requests."""
+        if self._lookup_server_thread is not None:
+            return
+
+        self._lookup_context = zmq.Context()
+        self._lookup_stop_event.clear()
+        self._lookup_server_socket = self._lookup_context.socket(zmq.REP)
+
+        if self._lookup_endpoint.startswith("ipc://"):
+            ipc_path = self._lookup_endpoint.replace("ipc://", "")
+            try:
+                os.unlink(ipc_path)
+            except FileNotFoundError:
+                pass
+            except PermissionError:
+                pass
+
+        self._lookup_server_socket.bind(self._lookup_endpoint)
+
+        thread = threading.Thread(target=self._lookup_server_loop, daemon=True)
+        thread.start()
+        self._lookup_server_thread = thread
+        print(f"[PegaKVConnector] Lookup server bound to {self._lookup_endpoint}")
+
+    def _lookup_server_loop(self) -> None:
+        """Handle lookup requests from the scheduler."""
+        assert self._lookup_server_socket is not None
+
+        while not self._lookup_stop_event.is_set():
+            try:
+                message = self._lookup_server_socket.recv()
+            except zmq.error.ZMQError:
+                if self._lookup_stop_event.is_set():
+                    break
+                continue
+
+            hit_blocks = 0
+            try:
+                payload = pickle.loads(message)
+                block_hashes = payload.get("block_hashes", [])
+                hit_blocks = self._count_available_block_prefix(block_hashes)
+            except Exception:
+                hit_blocks = 0
+
+            reply = pickle.dumps({"hit_blocks": hit_blocks})
+            try:
+                self._lookup_server_socket.send(reply)
+            except zmq.error.ZMQError:
+                if self._lookup_stop_event.is_set():
+                    break
+
+    def _count_available_block_prefix(self, block_hashes: List[bytes]) -> int:
+        """Return length of contiguous prefix available in CPU storage."""
+        if not block_hashes or not self._registered_layers:
+            return 0
+
+        layer_name = self._registered_layers[0]
+        availability = self.engine.check_kv_blocks_availability(
+            layer_name,
+            block_hashes,
+        )
+        hits = 0
+        for available in availability:
+            if not available:
+                break
+            hits += 1
+        return hits
+
+    def _ensure_lookup_client(self) -> None:
+        if self._lookup_client is not None:
+            return
+        if self._lookup_context is None:
+            self._lookup_context = zmq.Context()
+        self._lookup_client = self._lookup_context.socket(zmq.REQ)
+        # Avoid hanging forever if worker is not reachable
+        self._lookup_client.setsockopt(zmq.RCVTIMEO, 2000)
+        self._lookup_client.setsockopt(zmq.SNDTIMEO, 2000)
+        self._lookup_client.connect(self._lookup_endpoint)
+
+    def _send_lookup_request(self, req_id: str, block_hashes: List[bytes]) -> int:
+        """Query worker for contiguous cached prefix length (in blocks)."""
+        if not block_hashes:
+            return 0
+
+        try:
+            self._ensure_lookup_client()
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[PegaKVConnector] Failed to init lookup client: {exc}")
+            return 0
+
+        payload = pickle.dumps({
+            "req_id": req_id,
+            "block_hashes": block_hashes,
+        })
+
+        try:
+            assert self._lookup_client is not None
+            self._lookup_client.send(payload)
+            reply = self._lookup_client.recv()
+        except zmq.error.Again:
+            print(f"[PegaKVConnector] Lookup request for {req_id} timed out")
+            return 0
+        except zmq.error.ZMQError as exc:
+            print(f"[PegaKVConnector] Lookup ZMQ error for {req_id}: {exc}")
+            return 0
+
+        try:
+            response = pickle.loads(reply)
+        except Exception:
+            return 0
+
+        return int(response.get("hit_blocks", 0))
+
+    def _stop_lookup_server(self) -> None:
+        if self._lookup_server_thread is None:
+            return
+        self._lookup_stop_event.set()
+        if self._lookup_server_socket is not None:
+            try:
+                self._lookup_server_socket.close(0)
+            except Exception:
+                pass
+            self._lookup_server_socket = None
+        self._lookup_server_thread.join(timeout=1.0)
+        self._lookup_server_thread = None
+        if self._lookup_context is not None:
+            self._lookup_context.term()
+            self._lookup_context = None
+
     
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register KV cache tensors with the PegaEngine.
 
-        This method simulates cross-process IPC by:
-        1. Wrapping each tensor in CudaIPCWrapper (sender side)
-        2. Serializing the wrapper to bytes (cross-process transmission)
-        3. Deserializing the wrapper (receiver side)
-        4. Reconstructing tensor from IPC handle
-        5. Extracting GPU pointer and passing to Rust
-
         Args:
             kv_caches: Dictionary mapping layer names to KV cache tensors
         """
+        self._registered_layers = list(kv_caches.keys())
+
         for layer_name, kv_cache in kv_caches.items():
-            # Ensure tensor is contiguous and at offset 0
-            assert kv_cache.is_contiguous(), f"KV cache for {layer_name} must be contiguous"
-            assert kv_cache.storage_offset() == 0, f"KV cache for {layer_name} must have offset 0"
+            if kv_cache.storage_offset() != 0:
+                raise RuntimeError(
+                    f"KV cache for {layer_name} must have zero storage offset"
+                )
 
-            # Step 5: Extract GPU pointer and size
+            shape = tuple(kv_cache.shape)
+            stride = tuple(kv_cache.stride())
+            dtype = kv_cache.dtype
+            print(
+                f"[PegaKVConnector] register {layer_name}: shape={shape}, stride={stride}, dtype={dtype}, storage_bytes={kv_cache.untyped_storage().nbytes()}"
+            )
+
             data_ptr = kv_cache.data_ptr()
-            size_bytes = kv_cache.numel() * kv_cache.element_size()
+            size_bytes = kv_cache.untyped_storage().nbytes()
 
-            # Step 6: Pass GPU pointer to Rust (Rust only stores ptr and size)
-            self.engine.register_kv_cache_ptr(layer_name, data_ptr, size_bytes)
+            # Detect KV cache layout:
+            # - KV-first layout: shape = (2, num_blocks, block_size, num_heads, head_dim)
+            #   where shape[0] = 2 for K and V
+            # - Blocks-first layout: shape = (num_blocks, block_size, num_heads, head_dim)
+            #   where shape[0] = num_blocks
+            #
+            # We detect this by checking if shape[0] == 2, which indicates KV-first layout.
+            # In KV-first layout, the actual num_blocks is shape[1].
+            if len(shape) >= 2 and shape[0] == 2:
+                # KV-first layout: (2, num_blocks, ...)
+                num_blocks = shape[1]
+                bytes_per_block = stride[1] * kv_cache.element_size()
+                print(f"[PegaKVConnector] Detected KV-first layout for {layer_name}: num_blocks={num_blocks}")
+            else:
+                # Blocks-first layout: (num_blocks, ...)
+                num_blocks = shape[0]
+                bytes_per_block = stride[0] * kv_cache.element_size()
+                print(f"[PegaKVConnector] Detected blocks-first layout for {layer_name}: num_blocks={num_blocks}")
+
+            if bytes_per_block == 0:
+                raise RuntimeError(
+                    f"Invalid bytes_per_block for {layer_name}: stride={stride}"
+                )
+
+            self.engine.register_kv_cache(
+                layer_name,
+                data_ptr,
+                size_bytes,
+                num_blocks,
+                bytes_per_block,
+            )
 
     def shutdown(self):
         """Shutdown the connector and unregister all KV caches."""
+        self._stop_lookup_server()
+        if self._lookup_client is not None:
+            try:
+                self._lookup_client.close(0)
+            except Exception:
+                pass
+            self._lookup_client = None
+        if self._lookup_context is not None:
+            try:
+                self._lookup_context.term()
+            except Exception:
+                pass
+            self._lookup_context = None
         self.engine.unregister_all_kv_caches()
 
 
 __all__ = ["PegaKVConnector", "KVConnectorRole"]
-
