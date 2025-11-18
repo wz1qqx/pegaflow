@@ -5,16 +5,17 @@ This package provides:
 2. PegaKVConnector: vLLM KV connector for distributed inference
 """
 
-# Import Rust-based PegaEngine from the compiled extension
+# Import Rust-based PegaEngine and GpuMemory from the compiled extension
 try:
-    from .pegaflow import PegaEngine
+    from .pegaflow import PegaEngine, GpuMemory
 except ImportError:
     # Fallback for development when the Rust extension is not built
     PegaEngine = None
+    GpuMemory = None
 
 # Import Python-based vLLM connector
 from .connector import PegaKVConnector, KVConnectorRole
 
 __version__ = "0.0.1"
-__all__ = ["PegaEngine", "PegaKVConnector", "KVConnectorRole"]
+__all__ = ["PegaEngine", "GpuMemory", "PegaKVConnector", "KVConnectorRole"]
 
