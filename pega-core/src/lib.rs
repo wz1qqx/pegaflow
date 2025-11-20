@@ -40,13 +40,18 @@ pub struct Block {
     /// Pointer to pinned memory (not owned, managed by PegaEngine's pool)
     ptr: *mut u8,
     size: usize,
-    /// Allocation handle for freeing memory
-    allocation: Allocation,
+    /// Allocation handle for freeing memory (shared across multiple blocks)
+    allocation: Arc<Allocation>,
     pool: Arc<PinnedMemoryPool>,
 }
 
 impl Block {
-    fn new(ptr: *mut u8, size: usize, allocation: Allocation, pool: Arc<PinnedMemoryPool>) -> Self {
+    fn new(
+        ptr: *mut u8,
+        size: usize,
+        allocation: Arc<Allocation>,
+        pool: Arc<PinnedMemoryPool>,
+    ) -> Self {
         Self {
             ptr,
             size,
@@ -71,7 +76,10 @@ impl Block {
 
 impl Drop for Block {
     fn drop(&mut self) {
-        self.pool.free(self.allocation);
+        // Only free when this is the last reference to the allocation
+        if Arc::strong_count(&self.allocation) == 1 {
+            self.pool.free(*self.allocation);
+        }
     }
 }
 
@@ -151,11 +159,6 @@ impl PegaEngine {
         self.pinned_pool.allocate(size)
     }
 
-    /// Free pinned memory allocation
-    fn free_pinned(&self, allocation: Allocation) {
-        self.pinned_pool.free(allocation);
-    }
-
     /// Get pinned memory usage statistics
     pub fn get_pinned_memory_usage(&self) -> (usize, usize) {
         self.pinned_pool.usage()
@@ -165,59 +168,68 @@ impl PegaEngine {
         level = "debug",
         skip(self, block_ids, block_hashes),
         fields(layer = %layer_name, blocks = %block_ids.len(), hashes = %block_hashes.len()),
-        err
     )]
     pub fn save_kv_blocks_from_ipc(
         &mut self,
         layer_name: String,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
-    ) -> Result<(), String> {
-        if block_ids.len() != block_hashes.len() {
-            return Err("block_ids and block_hashes must have equal length".into());
-        }
+    ) {
+        assert_eq!(
+            block_ids.len(),
+            block_hashes.len(),
+            "block_ids and block_hashes must have equal length"
+        );
 
-        let Some(registration) = self.kv_caches.get(&layer_name) else {
-            return Err(format!("Layer {} not registered", layer_name));
-        };
+        let registration = self
+            .kv_caches
+            .get(&layer_name)
+            .unwrap_or_else(|| panic!("Layer {} not registered", layer_name));
 
-        for (block_id, block_hash) in block_ids.into_iter().zip(block_hashes.into_iter()) {
-            if block_id < 0 {
+        // Collect blocks that need to be saved
+        let mut blocks_to_save = Vec::with_capacity(block_ids.len());
+        for (block_id, block_hash) in block_ids.iter().zip(block_hashes.iter()) {
+            if *block_id < 0 {
                 continue;
             }
-            let block_idx = block_id as usize;
-            if block_idx >= registration.num_blocks {
-                return Err(format!(
-                    "Block {} out of range for layer {} ({} blocks registered)",
-                    block_idx, layer_name, registration.num_blocks
-                ));
-            }
+            let block_idx = *block_id as usize;
+            assert!(
+                block_idx < registration.num_blocks,
+                "Block {} out of range for layer {} ({} blocks registered)",
+                block_idx,
+                layer_name,
+                registration.num_blocks
+            );
 
             let key = (layer_name.clone(), block_hash.clone());
-
-            // Skip if already stored
-            if self.kv_storage.contains_key(&key) {
-                continue;
+            if !self.kv_storage.contains_key(&key) {
+                blocks_to_save.push((block_idx, key));
             }
+        }
 
-            let block_size = self.block_size(&registration)?;
-            let (allocation, cpu_ptr) = self.allocate_pinned(block_size);
+        if blocks_to_save.is_empty() {
+            return;
+        }
 
-            if let Err(err) = self.copy_block_gpu_to_cpu(&registration, block_idx, cpu_ptr) {
-                self.free_pinned(allocation);
-                return Err(err);
-            }
+        let block_size = self.block_size(&registration).unwrap();
+        let total_size = block_size * blocks_to_save.len();
+        let (allocation, base_ptr) = self.allocate_pinned(total_size);
+        let shared_allocation = Arc::new(allocation);
+
+        // Copy blocks and create Block objects
+        for (i, (block_idx, key)) in blocks_to_save.into_iter().enumerate() {
+            let cpu_ptr = unsafe { base_ptr.add(i * block_size) };
+            self.copy_block_gpu_to_cpu(&registration, block_idx, cpu_ptr)
+                .unwrap();
 
             let block = Arc::new(Block::new(
                 cpu_ptr,
                 block_size,
-                allocation,
+                Arc::clone(&shared_allocation),
                 Arc::clone(&self.pinned_pool),
             ));
             self.kv_storage.insert(key, block);
         }
-
-        Ok(())
     }
 
     /// Copy data from GPU to CPU

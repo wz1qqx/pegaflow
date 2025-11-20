@@ -94,10 +94,9 @@ impl PegaEngine {
         layer_name: String,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
-    ) -> PyResult<()> {
+    ) {
         self.engine
             .save_kv_blocks_from_ipc(layer_name, block_ids, block_hashes)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 
     /// Get storage statistics
