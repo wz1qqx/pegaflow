@@ -444,10 +444,12 @@ class PegaKVConnector(KVConnectorBase_V1):
             return (0, False)
 
         available_tokens = min(matched_blocks * self._block_size, num_tokens)
-        if available_tokens <= 0:
+        if available_tokens <= 1:
             return (0, False)
 
-        num_new_tokens = available_tokens - num_computed_tokens
+        # Always leave at least one prompt token for the scheduler to compute
+        reusable_tokens = available_tokens - 1
+        num_new_tokens = reusable_tokens - num_computed_tokens
 
         if num_new_tokens <= 0:
             print(f"[PegaKVConnector] Request {req_id}: All available cached tokens already consumed")
@@ -491,8 +493,7 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         # block hashes is  a list[bytes]
         self._request_block_hashes[req_id] = request.block_hashes
-        for block_hash in request.block_hashes:
-            print(f"block hash: {block_hash}")
+
         print(f"[PegaKVConnector] Saved {len(request.block_hashes)} block hashes for request {req_id}")
 
             

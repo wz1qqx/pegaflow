@@ -7,6 +7,7 @@ edition = "2021"
 cudarc = { version = "0.18.0", features = ["cuda-12040"] }
 tracing = "0.1"
 offset-allocator = "0.2.0"
+moka = { version = "0.12", features = ["sync"] }
 
 [dev-dependencies]
 criterion = "0.5"
