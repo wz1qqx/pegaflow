@@ -174,6 +174,10 @@ class PegaKVConnector(KVConnectorBase_V1):
             load_start = time.perf_counter()
             total_blocks = 0
             total_layers = 0
+            total_bytes = 0
+
+            # Aggregate per-layer loads to minimize Python<->Rust crossings.
+            layer_batches: Dict[str, Dict[str, List[Any]]] = {}
 
             for req_id, load_info in metadata.requests_to_load.items():
                 block_ids = load_info['block_ids']
@@ -187,33 +191,36 @@ class PegaKVConnector(KVConnectorBase_V1):
                     num_tokens,
                 )
 
-                # Load for each layer
-                for layer_name in forward_context.no_compile_layers:
-                    layer = forward_context.no_compile_layers[layer_name]
-
-                    # Only process layers that have kv_cache attribute (attention layers)
+                for layer_name, layer in forward_context.no_compile_layers.items():
                     if not hasattr(layer, 'kv_cache'):
                         continue
 
-                    try:
-                        # Call Rust backend to load KV blocks from CPU to GPU
-                        self.engine.load_kv_blocks_to_ipc(
-                            layer_name,
-                            block_ids,
-                            block_hashes
-                        )
-                        total_blocks += len(block_ids)
-                        total_layers += 1
+                    batch = layer_batches.setdefault(
+                        layer_name, {'block_ids': [], 'block_hashes': []}
+                    )
+                    batch['block_ids'].extend(block_ids)
+                    batch['block_hashes'].extend(block_hashes)
 
-                    except Exception as e:
-                        logger.debug(
-                            "[PegaKVConnector] Failed to load layer %s for request %s: %s",
-                            layer_name,
-                            req_id,
-                            e,
-                            exc_info=True,
-                        )
-                        # Continue with other layers even if one fails
+            for layer_name, batch in layer_batches.items():
+                if not batch['block_ids']:
+                    continue
+
+                try:
+                    bytes_transferred = self.engine.load_kv_blocks_to_ipc(
+                        layer_name,
+                        batch['block_ids'],
+                        batch['block_hashes'],
+                    )
+                    total_blocks += len(batch['block_ids'])
+                    total_layers += 1
+                    total_bytes += bytes_transferred
+                except Exception as e:
+                    logger.debug(
+                        "[PegaKVConnector] Failed to load layer %s: %s",
+                        layer_name,
+                        e,
+                        exc_info=True,
+                    )
 
             transfer_end = time.perf_counter()
             # ============================================================
@@ -225,18 +232,26 @@ class PegaKVConnector(KVConnectorBase_V1):
             transfer_time_ms = (transfer_end - load_start) * 1000
             sync_time_ms = (total_end - transfer_end) * 1000
             total_time_us = (total_end - load_start) * 1e6
+            total_time_s = total_time_us / 1e6
+            bandwidth_gbps = (total_bytes / 1e9) / total_time_s if total_time_s > 0 else 0.0
 
             logger.info(
-                "[PegaKVConnector] load %d blocks cost %.0f us",
+                "[PegaKVConnector] load %d blocks (%.2f GB) cost %.0f us, bandwidth=%.2f GB/s",
                 total_blocks,
+                total_bytes / 1e9,
                 total_time_us,
+                bandwidth_gbps,
             )
 
             # Get pinned memory usage
-            used_bytes, total_bytes = self.engine.get_pinned_memory_usage()
+            used_bytes, total_pinned_bytes = self.engine.get_pinned_memory_usage()
             used_gb = used_bytes / 1e9
-            total_gb = total_bytes / 1e9
-            usage_pct = (used_bytes / total_bytes * 100) if total_bytes > 0 else 0
+            total_gb = total_pinned_bytes / 1e9
+            usage_pct = (
+                (used_bytes / total_pinned_bytes * 100)
+                if total_pinned_bytes > 0
+                else 0
+            )
 
             logger.debug(
                 "[PegaKVConnector] Load details: transfer_time=%.2f ms, sync_time=%.2f ms, "

@@ -336,7 +336,7 @@ impl PegaEngine {
         layer_name: String,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
-    ) -> Result<(), String> {
+    ) -> Result<usize, String> {
         let start_time = Instant::now();
         if block_ids.len() != block_hashes.len() {
             return Err("block_ids and block_hashes must have equal length".into());
@@ -385,12 +385,19 @@ impl PegaEngine {
 
         let end_time = Instant::now();
         // print cost
-        debug!(
-            "load_kv_blocks_to_ipc: total_transfer = {} bytes, time = {} us",
+        let elapsed = (end_time - start_time).as_secs_f64();
+        let bandwidth = if elapsed > 0.0 {
+            total_transfer as f64 / elapsed
+        } else {
+            0.0
+        };
+        info!(
             total_transfer,
-            (end_time - start_time).as_micros()
+            elapsed_us = (end_time - start_time).as_micros(),
+            bandwidth_gbps = bandwidth / 1e9,
+            "Completed load_kv_blocks_to_ipc"
         );
-        Ok(())
+        Ok(total_transfer)
     }
 
     /// Calculate the byte offset for a given block/segment combination.
