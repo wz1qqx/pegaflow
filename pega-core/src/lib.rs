@@ -39,7 +39,7 @@ use crate::pinned_pool::PinnedMemoryPool;
 const DEFAULT_PINNED_POOL_BYTES: usize = 20 * 1024 * 1024 * 1024; // 10GB
 const CACHE_USAGE_RATIO: f64 = 0.90;
 
-type BlockKey = (String, Vec<u8>);
+type BlockKey = Vec<u8>;
 
 pub struct PegaEngine {
     /// Store registered KV cache pointers (new IPC wrapper): layer_name -> registration
@@ -237,6 +237,14 @@ impl PegaEngine {
         self.pinned_pool.usage()
     }
 
+    fn encode_key_to_buffer(layer_name: &str, block_hash: &[u8], buffer: &mut Vec<u8>) {
+        buffer.clear();
+        buffer.reserve(layer_name.len() + 1 + block_hash.len());
+        buffer.extend_from_slice(layer_name.as_bytes());
+        buffer.push(0);
+        buffer.extend_from_slice(block_hash);
+    }
+
     fn record_layer_event(&self, layer_name: &str, event: CudaEvent) {
         let mut guard = self.layer_events.lock().expect("layer events map poisoned");
 
@@ -267,6 +275,8 @@ impl PegaEngine {
 
         // Collect blocks that need to be saved
         let mut blocks_to_save = Vec::with_capacity(block_ids.len());
+        let mut key_buffer = Vec::new();
+
         for (block_id, block_hash) in block_ids.iter().zip(block_hashes.iter()) {
             if *block_id < 0 {
                 continue;
@@ -280,9 +290,9 @@ impl PegaEngine {
                 registration.num_blocks
             );
 
-            let key = (layer_name.clone(), block_hash.clone());
-            if !self.kv_storage.contains_key(&key) {
-                blocks_to_save.push((block_idx, key));
+            Self::encode_key_to_buffer(&layer_name, block_hash, &mut key_buffer);
+            if !self.kv_storage.contains_key(key_buffer.as_slice()) {
+                blocks_to_save.push((block_idx, key_buffer.clone()));
             }
         }
 
@@ -406,9 +416,11 @@ impl PegaEngine {
     /// Remove a KV block and free its memory
     #[instrument(level = "info", skip(self, block_hash), fields(layer = %layer_name))]
     pub fn remove_kv_block(&mut self, layer_name: String, block_hash: Vec<u8>) -> bool {
-        let key = (layer_name, block_hash);
-        if self.kv_storage.contains_key(&key) {
-            self.kv_storage.invalidate(&key);
+        let mut key_buffer = Vec::new();
+        Self::encode_key_to_buffer(&layer_name, &block_hash, &mut key_buffer);
+
+        if self.kv_storage.contains_key(key_buffer.as_slice()) {
+            self.kv_storage.invalidate(key_buffer.as_slice());
             self.kv_storage.run_pending_tasks();
             true
         } else {
@@ -443,10 +455,11 @@ impl PegaEngine {
         block_hashes: Vec<Vec<u8>>,
     ) -> Vec<bool> {
         let mut availability = Vec::with_capacity(block_hashes.len());
+        let mut key_buffer = Vec::new();
 
         for (idx, block_hash) in block_hashes.iter().enumerate() {
-            let key = (layer_name.clone(), block_hash.clone());
-            let available = self.kv_storage.contains_key(&key);
+            Self::encode_key_to_buffer(&layer_name, block_hash, &mut key_buffer);
+            let available = self.kv_storage.contains_key(key_buffer.as_slice());
             availability.push(available);
 
             let hash_preview: Vec<u8> = block_hash.iter().copied().take(8).collect();
@@ -494,16 +507,24 @@ impl PegaEngine {
 
         // Collect valid blocks to load
         let mut blocks_to_load = Vec::with_capacity(block_ids.len());
+        let mut key_buffer = Vec::new();
+
         for (block_id, block_hash) in block_ids.iter().zip(block_hashes.iter()) {
             let block_idx = *block_id as usize;
 
-            let key = (layer_name.to_string(), block_hash.clone());
-            let Some(block) = self.kv_storage.get(&key) else {
+            Self::encode_key_to_buffer(layer_name, block_hash, &mut key_buffer);
+            let Some(block) = self.kv_storage.get(key_buffer.as_slice()) else {
                 return Err(format!("Missing KV block for layer {}", layer_name));
             };
 
             blocks_to_load.push((block_idx, block));
         }
+
+        let end_time = Instant::now();
+        info!(
+            "load_kv_blocks_to_ipc: lookup time: {} us",
+            (end_time - start_time).as_micros()
+        );
 
         let mut total_transfer = 0;
         let stream = self.stream.clone();
