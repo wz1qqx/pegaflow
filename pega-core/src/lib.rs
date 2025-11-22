@@ -30,6 +30,7 @@ use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
 use moka::sync::Cache;
 use std::{
     collections::HashMap,
+    ptr::NonNull,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -60,6 +61,7 @@ impl LayerBlocksWithWeight {
 
     /// Fixed weight per block hash entry (assumes all layers populated)
     /// This avoids locking during cache weigher calls
+    /// FIXME
     fn weight(&self) -> u32 {
         1 // Simple fixed weight, cache will evict based on entry count
     }
@@ -99,9 +101,9 @@ pub struct KVCacheRegistration {
 
 pub struct Block {
     /// Pointer to K segment (or combined data if contiguous)
-    k_ptr: *mut u8,
+    k_ptr: NonNull<u8>,
     /// Pointer to V segment (if stored separately)
-    v_ptr: Option<*mut u8>,
+    v_ptr: Option<NonNull<u8>>,
     size: usize,
     /// Shared RAII allocation handle for K memory (automatically freed when last reference drops)
     #[allow(dead_code)]
@@ -114,7 +116,7 @@ pub struct Block {
 impl Block {
     fn new_contiguous(ptr: *mut u8, size: usize, allocation: Arc<PinnedAllocation>) -> Self {
         Self {
-            k_ptr: ptr,
+            k_ptr: unsafe { NonNull::new_unchecked(ptr) },
             v_ptr: None,
             size,
             k_allocation: allocation,
@@ -130,8 +132,8 @@ impl Block {
         v_allocation: Arc<PinnedAllocation>,
     ) -> Self {
         Self {
-            k_ptr,
-            v_ptr: Some(v_ptr),
+            k_ptr: unsafe { NonNull::new_unchecked(k_ptr) },
+            v_ptr: Some(unsafe { NonNull::new_unchecked(v_ptr) }),
             size,
             k_allocation,
             v_allocation: Some(v_allocation),
@@ -139,11 +141,11 @@ impl Block {
     }
 
     fn k_ptr(&self) -> *mut u8 {
-        self.k_ptr
+        self.k_ptr.as_ptr()
     }
 
     fn v_ptr(&self) -> Option<*mut u8> {
-        self.v_ptr
+        self.v_ptr.map(|ptr| ptr.as_ptr())
     }
 
     fn size(&self) -> usize {
@@ -151,7 +153,7 @@ impl Block {
     }
 }
 
-// Safety: Block wraps read-only pinned allocations with RAII cleanup
+// TODO: Add safety comments, it is a bit tricky
 unsafe impl Send for Block {}
 unsafe impl Sync for Block {}
 
