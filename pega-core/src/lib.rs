@@ -436,9 +436,9 @@ impl PegaEngine {
     ///
     /// Returns the number of contiguous blocks available from the start.
     /// Stops counting at the first unavailable block.
+    /// Uses the first registered layer (layer_id = 0) for availability check.
     ///
     /// Args:
-    ///   - layer_name: Name of the layer
     ///   - block_hashes: List of block hashes to check
     ///
     /// Returns:
@@ -446,22 +446,17 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self, block_hashes),
-        fields(layer = %layer_name, requested = %block_hashes.len()),
+        fields(requested = %block_hashes.len()),
         ret
     )]
-    pub fn count_prefix_hit_blocks(
-        &self,
-        layer_name: &str,
-        block_hashes: &[Vec<u8>],
-    ) -> usize {
-        let layer_id = match self.get_layer_id(&layer_name) {
-            Some(id) => id,
-            None => {
-                // Layer not registered, all blocks unavailable
-                return 0;
-            }
-        };
+    pub fn count_prefix_hit_blocks(&self, block_hashes: &[Vec<u8>]) -> usize {
+        // Use first layer for availability check (layer_id = 0)
+        // If no layers registered, all blocks are unavailable
+        if self.num_layers() == 0 {
+            return 0;
+        }
 
+        let layer_id = 0;
         let mut hit_count = 0;
 
         for block_hash in block_hashes.iter() {

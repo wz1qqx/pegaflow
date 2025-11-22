@@ -39,11 +39,7 @@ pub(crate) fn segment_offset(
     if offset + registration.bytes_per_block > registration.size_bytes {
         return Err(format!(
             "Block {} segment {} exceeds registered memory (offset {}, size {}, limit {})",
-            block_idx,
-            segment_idx,
-            offset,
-            registration.bytes_per_block,
-            registration.size_bytes
+            block_idx, segment_idx, offset, registration.bytes_per_block, registration.size_bytes
         ));
     }
 
@@ -88,12 +84,7 @@ pub(crate) fn copy_gpu_to_cpu(
 }
 
 /// Copy data from CPU to GPU asynchronously on the provided stream
-#[instrument(
-    level = "debug",
-    skip(cpu_buffer, stream),
-    fields(offset, size),
-    err
-)]
+#[instrument(level = "debug", skip(cpu_buffer, stream), fields(offset, size), err)]
 pub(crate) fn copy_cpu_to_gpu_async(
     gpu_base_ptr: u64,
     offset: usize,
@@ -306,9 +297,8 @@ fn copy_cpu_to_gpu_strided(
         let dst_offset = segment_offset(registration, block_idx, segment_idx)?;
         let src_offset = segment_idx * registration.bytes_per_block;
         let src_segment_ptr = unsafe { src_ptr.add(src_offset) };
-        let buffer = unsafe {
-            std::slice::from_raw_parts(src_segment_ptr, registration.bytes_per_block)
-        };
+        let buffer =
+            unsafe { std::slice::from_raw_parts(src_segment_ptr, registration.bytes_per_block) };
 
         copy_cpu_to_gpu_async(
             registration.data_ptr,

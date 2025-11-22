@@ -663,14 +663,10 @@ class PegaKVConnector(KVConnectorBase_V1):
 
     def _count_available_block_prefix(self, block_hashes: List[bytes]) -> int:
         """Return length of contiguous prefix available in CPU storage."""
-        if not block_hashes or not self._registered_layers:
+        if not block_hashes:
             return 0
 
-        layer_name = self._registered_layers[0]
-        return self.engine.count_prefix_hit_blocks(
-            layer_name,
-            block_hashes,
-        )
+        return self.engine.count_prefix_hit_blocks(block_hashes)
 
     def _ensure_lookup_client(self) -> None:
         if self._lookup_client is not None:

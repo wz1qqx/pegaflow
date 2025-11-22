@@ -106,9 +106,9 @@ impl PegaEngine {
     ///
     /// Returns the number of contiguous blocks available from the start.
     /// Stops counting at the first unavailable block.
+    /// Uses the first registered layer (layer_id = 0) for availability check.
     ///
     /// Args:
-    ///     layer_name: Name of the layer
     ///     block_hashes: List of block hashes to check (list of bytes)
     ///
     /// Returns:
@@ -116,13 +116,9 @@ impl PegaEngine {
     fn count_prefix_hit_blocks(
         &self,
         py: Python<'_>,
-        layer_name: String,
         block_hashes: Vec<Vec<u8>>,
     ) -> usize {
-        py.allow_threads(|| {
-            self.engine
-                .count_prefix_hit_blocks(&layer_name, &block_hashes)
-        })
+        py.allow_threads(|| self.engine.count_prefix_hit_blocks(&block_hashes))
     }
 
     /// Wait until the async transfer for `layer_name` completes.
