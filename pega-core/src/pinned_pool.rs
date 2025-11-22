@@ -1,8 +1,43 @@
-use std::{ptr::NonNull, sync::Mutex};
+use std::{
+    ptr::NonNull,
+    sync::{Arc, Mutex},
+};
 
 use tracing::info;
 
 use crate::allocator::{Allocation, ScaledOffsetAllocator};
+
+/// RAII guard for a pinned memory allocation.
+/// Automatically frees the allocation when dropped.
+pub struct PinnedAllocation {
+    allocation: Allocation,
+    ptr: NonNull<u8>,
+    pool: Arc<PinnedMemoryPool>,
+}
+
+impl PinnedAllocation {
+    /// Get a const pointer to the allocated memory
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Get a mutable pointer to the allocated memory
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Get the size of the allocation in bytes
+    pub fn size(&self) -> usize {
+        self.allocation.size_bytes as usize
+    }
+}
+
+impl Drop for PinnedAllocation {
+    fn drop(&mut self) {
+        // Automatically free the allocation when the guard is dropped
+        self.pool.free_internal(self.allocation);
+    }
+}
 
 /// Manages a CUDA pinned memory pool and a byte-addressable allocator.
 pub struct PinnedMemoryPool {
@@ -45,7 +80,8 @@ impl PinnedMemoryPool {
     }
 
     /// Allocate pinned memory from the pool. Panics when the allocation cannot be satisfied.
-    pub fn allocate(&self, size: usize) -> (Allocation, *mut u8) {
+    /// Returns a RAII guard that automatically frees the allocation when dropped.
+    pub fn allocate(self: &Arc<Self>, size: usize) -> PinnedAllocation {
         if size == 0 {
             panic!("Cannot allocate zero bytes from the pinned pool");
         }
@@ -67,11 +103,19 @@ impl PinnedMemoryPool {
         };
 
         let ptr = unsafe { self.base_ptr.as_ptr().add(allocation.offset_bytes as usize) };
-        (allocation, ptr)
+        let ptr = NonNull::new(ptr).expect("PinnedMemoryPool returned null pointer");
+
+        PinnedAllocation {
+            allocation,
+            ptr,
+            pool: Arc::clone(self),
+        }
     }
 
-    /// Free a pinned memory allocation.
-    pub fn free(&self, allocation: Allocation) {
+    /// Internal method to free a pinned memory allocation.
+    /// This is called automatically by PinnedAllocation's Drop implementation.
+    /// Users should not call this directly - use PinnedAllocation RAII instead.
+    pub(crate) fn free_internal(&self, allocation: Allocation) {
         let mut allocator = self.allocator.lock().unwrap();
         allocator.free(allocation);
     }
@@ -99,4 +143,3 @@ impl Drop for PinnedMemoryPool {
         info!("Freed pinned memory pool");
     }
 }
-

@@ -2,6 +2,8 @@ pub mod allocator;
 pub mod pinned_pool;
 mod transfer;
 
+pub use pinned_pool::PinnedAllocation;
+
 // ============================================================================
 // PegaEngine currently prioritizes vLLM's layer-first (KV-first) tensor layout.
 // This means all K segments are contiguous, followed by all V segments, so the
@@ -24,15 +26,13 @@ mod transfer;
 // significantly improving PCIe bandwidth utilization compared to strided copies.
 // ============================================================================
 
+use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
+use moka::sync::Cache;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
     time::Instant,
 };
-
-use allocator::Allocation;
-use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
-use moka::sync::Cache;
 use tracing::{debug, info, instrument};
 
 use crate::pinned_pool::PinnedMemoryPool;
@@ -75,27 +75,22 @@ pub struct Block {
     /// Pointer to V segment (if stored separately)
     v_ptr: Option<*mut u8>,
     size: usize,
-    /// Allocation handle for K memory
-    k_allocation: Arc<Allocation>,
-    /// Allocation handle for V memory (if separate from K)
-    v_allocation: Option<Arc<Allocation>>,
-    pool: Arc<PinnedMemoryPool>,
+    /// Shared RAII allocation handle for K memory (automatically freed when last reference drops)
+    #[allow(dead_code)]
+    k_allocation: Arc<PinnedAllocation>,
+    /// Shared RAII allocation handle for V memory (if separate from K)
+    #[allow(dead_code)]
+    v_allocation: Option<Arc<PinnedAllocation>>,
 }
 
 impl Block {
-    fn new_contiguous(
-        ptr: *mut u8,
-        size: usize,
-        allocation: Arc<Allocation>,
-        pool: Arc<PinnedMemoryPool>,
-    ) -> Self {
+    fn new_contiguous(ptr: *mut u8, size: usize, allocation: Arc<PinnedAllocation>) -> Self {
         Self {
             k_ptr: ptr,
             v_ptr: None,
             size,
             k_allocation: allocation,
             v_allocation: None,
-            pool,
         }
     }
 
@@ -103,9 +98,8 @@ impl Block {
         k_ptr: *mut u8,
         v_ptr: *mut u8,
         size: usize,
-        k_allocation: Arc<Allocation>,
-        v_allocation: Arc<Allocation>,
-        pool: Arc<PinnedMemoryPool>,
+        k_allocation: Arc<PinnedAllocation>,
+        v_allocation: Arc<PinnedAllocation>,
     ) -> Self {
         Self {
             k_ptr,
@@ -113,7 +107,6 @@ impl Block {
             size,
             k_allocation,
             v_allocation: Some(v_allocation),
-            pool,
         }
     }
 
@@ -135,22 +128,7 @@ impl Block {
     }
 }
 
-impl Drop for Block {
-    fn drop(&mut self) {
-        // Free K allocation if last reference
-        if Arc::strong_count(&self.k_allocation) == 1 {
-            self.pool.free(*self.k_allocation);
-        }
-        // Free V allocation if exists and is last reference
-        if let Some(ref v_allocation) = self.v_allocation {
-            if Arc::strong_count(v_allocation) == 1 {
-                self.pool.free(**v_allocation);
-            }
-        }
-    }
-}
-
-// Safety: Block wraps a read-only pinned allocation; freeing is handled through its Drop.
+// Safety: Block wraps read-only pinned allocations with RAII cleanup
 unsafe impl Send for Block {}
 unsafe impl Sync for Block {}
 
@@ -228,8 +206,8 @@ impl PegaEngine {
         self.kv_caches.len()
     }
 
-    /// Allocate pinned memory from the pool. Panics when the allocation cannot be satisfied.
-    fn allocate_pinned(&self, size: usize) -> (Allocation, *mut u8) {
+    /// Allocate pinned memory from the pool. Returns RAII guard. Panics when the allocation cannot be satisfied.
+    fn allocate_pinned(&self, size: usize) -> PinnedAllocation {
         self.pinned_pool.allocate(size)
     }
 
@@ -312,8 +290,10 @@ impl PegaEngine {
             let v_total_size = segment_size * num_blocks;
 
             // Allocate separate regions for K and V segments
-            let (k_allocation, k_base_ptr) = self.allocate_pinned(k_total_size);
-            let (v_allocation, v_base_ptr) = self.allocate_pinned(v_total_size);
+            let k_allocation = self.allocate_pinned(k_total_size);
+            let v_allocation = self.allocate_pinned(v_total_size);
+            let k_base_ptr = k_allocation.as_mut_ptr();
+            let v_base_ptr = v_allocation.as_mut_ptr();
             let k_shared_allocation = Arc::new(k_allocation);
             let v_shared_allocation = Arc::new(v_allocation);
 
@@ -363,14 +343,14 @@ impl PegaEngine {
                     block_size,
                     Arc::clone(&k_shared_allocation),
                     Arc::clone(&v_shared_allocation),
-                    Arc::clone(&self.pinned_pool),
                 ));
                 self.kv_storage.insert(key, block);
             }
         } else {
             // Original logic for contiguous or single-segment layouts
             let total_size = block_size * num_blocks;
-            let (allocation, base_ptr) = self.allocate_pinned(total_size);
+            let allocation = self.allocate_pinned(total_size);
+            let base_ptr = allocation.as_mut_ptr();
             let shared_allocation = Arc::new(allocation);
 
             // Copy blocks and create Block objects
@@ -382,7 +362,6 @@ impl PegaEngine {
                     cpu_ptr,
                     block_size,
                     Arc::clone(&shared_allocation),
-                    Arc::clone(&self.pinned_pool),
                 ));
                 self.kv_storage.insert(key, block);
             }
