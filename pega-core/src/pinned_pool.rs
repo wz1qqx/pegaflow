@@ -79,9 +79,9 @@ impl PinnedMemoryPool {
         }
     }
 
-    /// Allocate pinned memory from the pool. Panics when the allocation cannot be satisfied.
+    /// Allocate pinned memory from the pool. Returns None when the allocation cannot be satisfied.
     /// Returns a RAII guard that automatically frees the allocation when dropped.
-    pub fn allocate(self: &Arc<Self>, size: usize) -> PinnedAllocation {
+    pub fn allocate(self: &Arc<Self>, size: usize) -> Option<PinnedAllocation> {
         if size == 0 {
             panic!("Cannot allocate zero bytes from the pinned pool");
         }
@@ -91,13 +91,7 @@ impl PinnedMemoryPool {
         let allocation = match allocator.allocate(size as u64) {
             Ok(Some(allocation)) => allocation,
             Ok(None) => {
-                let report = allocator.storage_report();
-                panic!(
-                    "Pinned memory pool exhausted! Requested: {:.2} MB, Free: {:.2} MB, Largest: {:.2} MB",
-                    size as f64 / 1e6,
-                    report.total_free_bytes as f64 / 1e6,
-                    report.largest_free_allocation_bytes as f64 / 1e6
-                );
+                return None; // Pool exhausted, caller can retry after eviction
             }
             Err(err) => panic!("Pinned memory allocation error: {}", err),
         };
@@ -105,11 +99,11 @@ impl PinnedMemoryPool {
         let ptr = unsafe { self.base_ptr.as_ptr().add(allocation.offset_bytes as usize) };
         let ptr = NonNull::new(ptr).expect("PinnedMemoryPool returned null pointer");
 
-        PinnedAllocation {
+        Some(PinnedAllocation {
             allocation,
             ptr,
             pool: Arc::clone(self),
-        }
+        })
     }
 
     /// Internal method to free a pinned memory allocation.
