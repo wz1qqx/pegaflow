@@ -65,7 +65,7 @@ def timing_wrapper(func):
             return result
         finally:
             elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.info(
+            logger.debug(
                 "[PegaKVConnector] %s took %.2f ms",
                 func.__name__,
                 elapsed_ms,
@@ -411,7 +411,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             total_time_ms = (total_end - total_start) * 1000
 
             if total_blocks_saved > 0:
-                logger.info(
+                logger.debug(
                     "[PegaKVConnector] saved %d blocks across %d layers (%.2f ms)",
                     total_blocks_saved,
                     total_layers_saved,

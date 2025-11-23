@@ -38,7 +38,7 @@ use tracing::{debug, info, instrument};
 
 use crate::pinned_pool::PinnedMemoryPool;
 
-const DEFAULT_PINNED_POOL_BYTES: usize = 20 * 1024 * 1024 * 1024; // 10GB
+const DEFAULT_PINNED_POOL_BYTES: usize = 50 * 1024 * 1024 * 1024; // 10GB
 
 type BlockHash = Vec<u8>;
 
@@ -254,22 +254,26 @@ impl PegaEngine {
                 return allocation;
             }
 
-            let (used, total) = self.pinned_pool.usage();
-            info!(
-                "Pinned memory pool exhausted, evicting LRU entry (requested: {:.2} MB, used: {:.2} MB, total: {:.2} MB)",
-                size as f64 / 1e6,
-                used as f64 / 1e6,
-                total as f64 / 1e6
-            );
+            // Allocation failed, try to evict multiple LRU entries from cache at once
+            // Batch eviction reduces lock contention and loop iterations
+            const BATCH_EVICT_COUNT: usize = 128;
+            let mut evicted_count = 0;
+            {
+                let mut cache = self.kv_storage.lock().unwrap();
+                for _ in 0..BATCH_EVICT_COUNT {
+                    if cache.remove_lru().is_some() {
+                        evicted_count += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
 
-            // Allocation failed, try to evict LRU entry from cache
-            if let Some((evicted_hash, _)) = self.kv_storage.lock().unwrap().remove_lru() {
+            if evicted_count > 0 {
                 info!(
-                    "Pinned memory pool exhausted, evicted LRU entry (hash len: {})",
-                    evicted_hash.len()
+                    "Pinned memory pool exhausted, evicted {} LRU entries in batch",
+                    evicted_count
                 );
-                // The evicted Arc<LayerBlocksWithWeight> will be dropped here,
-                // which will eventually free the pinned allocations via RAII
                 continue;
             } else {
                 // Cache is empty, but still can't allocate - genuine OOM
