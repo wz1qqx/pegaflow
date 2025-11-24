@@ -37,6 +37,7 @@ import os
 import pickle
 import signal
 import sys
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 import msgpack
@@ -51,6 +52,12 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ContextState:
+    device_id: int
+    tensors: Dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 class CudaIPCWrapper:
@@ -91,20 +98,19 @@ class PegaEngineServer:
             device: CUDA device index
         """
         self.socket_path = socket_path
-        self.device = device
+        self.default_device = device
 
         # Initialize CUDA
         torch.cuda.init()
         torch.cuda.set_device(device)
-        logger.info("Initialized CUDA device %d", device)
+        logger.info("Initialized default CUDA device %d", device)
 
         # Initialize Rust PegaEngine
         self.engine = PegaEngine()
         logger.info("Initialized PegaEngine")
 
-        # Store reconstructed tensors to keep them alive
-        # Key: layer_name, Value: torch.Tensor
-        self._tensors: Dict[str, torch.Tensor] = {}
+        # Store reconstructed tensors per context to keep them alive
+        self._contexts: Dict[str, _ContextState] = {}
 
         # ZMQ setup
         self.context = zmq.Context()
@@ -123,6 +129,42 @@ class PegaEngineServer:
 
         self.running = False
 
+    def _require_context_id(self, payload: Dict[str, Any]) -> str:
+        context_id = payload.get("instance_id") or payload.get("context_id")
+        if not context_id:
+            raise ValueError("instance_id not provided in payload")
+        return str(context_id)
+
+    def _get_or_create_context(
+        self,
+        context_id: str,
+        device_id: Optional[int],
+    ) -> _ContextState:
+        if context_id in self._contexts:
+            state = self._contexts[context_id]
+            if device_id is not None and state.device_id != device_id:
+                raise ValueError(
+                    f"Context {context_id} already bound to device {state.device_id}, got {device_id}"
+                )
+            return state
+
+        resolved_device = device_id if device_id is not None else self.default_device
+        state = _ContextState(device_id=resolved_device)
+        self._contexts[context_id] = state
+        return state
+
+    def _drop_context(self, context_id: str) -> None:
+        state = self._contexts.pop(context_id, None)
+        if state:
+            state.tensors.clear()
+        try:
+            self.engine.unregister_context(context_id)
+        except Exception as exc:
+            if state is None:
+                logger.debug("Context %s already unregistered: %s", context_id, exc)
+            else:
+                logger.error("Failed to unregister context %s: %s", context_id, exc)
+
     def _handle_register_context(self, payload: dict) -> dict:
         """Handle REGISTER_CONTEXT command - register KV cache from IPC handle.
 
@@ -140,25 +182,34 @@ class PegaEngineServer:
             {'status': 'success'} or {'status': 'error', 'message': str}
         """
         try:
+            context_id = self._require_context_id(payload)
             layer_name = payload['layer_name']
             wrapper_bytes = payload['wrapper_bytes']
             num_blocks = payload['num_blocks']
             bytes_per_block = payload['bytes_per_block']
             kv_stride_bytes = payload['kv_stride_bytes']
             segments = payload['segments']
+            device_id = payload.get('device_id')
+
+            state = self._get_or_create_context(context_id, device_id)
+
+            # Ensure CUDA operations run on the correct device
+            torch.cuda.set_device(state.device_id)
 
             # Reconstruct tensor from IPC handle
             wrapper = pickle.loads(wrapper_bytes)
             tensor = wrapper.to_tensor()
 
             # Store tensor reference to keep GPU memory alive
-            self._tensors[layer_name] = tensor
+            state.tensors[layer_name] = tensor
 
             # Register with Rust PegaEngine using raw pointer
             data_ptr = tensor.data_ptr()
             size_bytes = tensor.untyped_storage().nbytes()
 
             self.engine.register_context_layer(
+                context_id,
+                state.device_id,
                 layer_name,
                 data_ptr,
                 size_bytes,
@@ -169,8 +220,8 @@ class PegaEngineServer:
             )
 
             logger.info(
-                "Registered layer '%s': %d blocks, %d bytes/block, ptr=0x%x",
-                layer_name, num_blocks, bytes_per_block, data_ptr
+                "Registered layer '%s' for context %s (device %d): %d blocks, %d bytes/block, ptr=0x%x",
+                layer_name, context_id, state.device_id, num_blocks, bytes_per_block, data_ptr
             )
 
             return {'status': 'success'}
@@ -179,12 +230,12 @@ class PegaEngineServer:
             logger.error("Failed to register context layer: %s", e, exc_info=True)
             return {'status': 'error', 'message': str(e)}
 
-    def _handle_unregister_context(self) -> dict:
+    def _handle_unregister_context(self, payload: dict) -> dict:
         """Handle UNREGISTER_CONTEXT command - clear registered context."""
         try:
-            self.engine.unregister_context()
-            self._tensors.clear()
-            logger.info("Unregistered active inference context")
+            context_id = self._require_context_id(payload)
+            self._drop_context(context_id)
+            logger.info("Unregistered context %s", context_id)
             return {'status': 'success'}
         except Exception as e:
             logger.error("Failed to unregister context: %s", e, exc_info=True)
@@ -204,19 +255,21 @@ class PegaEngineServer:
             {'status': 'success'} or {'status': 'error', 'message': str}
         """
         try:
+            context_id = self._require_context_id(payload)
             layer_name = payload['layer_name']
             block_ids = payload['block_ids']
             block_hashes = payload['block_hashes']
 
             self.engine.save_kv_blocks_from_ipc(
+                context_id,
                 layer_name,
                 block_ids,
                 block_hashes
             )
 
             logger.debug(
-                "Saved %d blocks for layer '%s'",
-                len(block_ids), layer_name
+                "Saved %d blocks for layer '%s' (context %s)",
+                len(block_ids), layer_name, context_id
             )
 
             return {'status': 'success'}
@@ -244,19 +297,21 @@ class PegaEngineServer:
             or {'status': 'error', 'message': str}
         """
         try:
+            context_id = self._require_context_id(payload)
             layer_names = payload['layer_names']
             block_ids = payload['block_ids']
             block_hashes = payload['block_hashes']
 
             num_layers_loaded, total_bytes = self.engine.batch_load_kv_blocks(
+                context_id,
                 layer_names,
                 block_ids,
                 block_hashes
             )
 
             logger.debug(
-                "Loaded %d blocks across %d layers (%d bytes)",
-                len(block_ids), num_layers_loaded, total_bytes
+                "Loaded %d blocks across %d layers (%d bytes) for context %s",
+                len(block_ids), num_layers_loaded, total_bytes, context_id
             )
 
             return {
@@ -282,9 +337,10 @@ class PegaEngineServer:
             or {'status': 'error', 'message': str}
         """
         try:
+            context_id = self._require_context_id(payload)
             block_hashes = payload['block_hashes']
 
-            hit_blocks = self.engine.count_prefix_hit_blocks(block_hashes)
+            hit_blocks = self.engine.count_prefix_hit_blocks(context_id, block_hashes)
 
             return {
                 'status': 'success',
@@ -307,8 +363,9 @@ class PegaEngineServer:
             {'status': 'success'} or {'status': 'error', 'message': str}
         """
         try:
+            context_id = self._require_context_id(payload)
             layer_name = payload['layer_name']
-            self.engine.wait_for_layer_transfer(layer_name)
+            self.engine.wait_for_layer_transfer(context_id, layer_name)
             return {'status': 'success'}
         except Exception as e:
             logger.error("Failed to wait for layer: %s", e, exc_info=True)
@@ -317,6 +374,8 @@ class PegaEngineServer:
     def _handle_shutdown(self, payload: dict) -> dict:
         """Handle SHUTDOWN command - graceful shutdown."""
         logger.info("Received shutdown command")
+        for context_id in list(self._contexts.keys()):
+            self._drop_context(context_id)
         self.running = False
         return {'status': 'success'}
 
@@ -341,7 +400,7 @@ class PegaEngineServer:
                 if command in ('REGISTER', 'REGISTER_CONTEXT'):
                     response = self._handle_register_context(payload)
                 elif command in ('UNREGISTER', 'UNREGISTER_CONTEXT'):
-                    response = self._handle_unregister_context()
+                    response = self._handle_unregister_context(payload)
                 elif command == 'SAVE':
                     response = self._handle_save(payload)
                 elif command == 'LOAD':
@@ -384,13 +443,8 @@ class PegaEngineServer:
         self.running = False
 
         # Unregister all KV caches
-        try:
-            self.engine.unregister_context()
-        except Exception as e:
-            logger.error("Error unregistering context: %s", e)
-
-        # Clear tensor references
-        self._tensors.clear()
+        for context_id in list(self._contexts.keys()):
+            self._drop_context(context_id)
 
         # Close ZMQ socket
         try:

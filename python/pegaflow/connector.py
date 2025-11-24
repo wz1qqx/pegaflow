@@ -26,6 +26,7 @@ import os
 import pickle
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import msgpack
@@ -126,6 +127,34 @@ class PegaKVConnector(KVConnectorBase_V1):
         """
         super().__init__(vllm_config, role)
 
+        instance_id = getattr(vllm_config, "instance_id", "") or os.environ.get(
+            "PEGAFLOW_INSTANCE_ID", ""
+        )
+        if not instance_id:
+            instance_id = uuid.uuid4().hex
+            logger.info(
+                "[PegaKVConnector] No instance_id from vLLM; generated fallback %s",
+                instance_id,
+            )
+        self._instance_id = instance_id
+
+        self._device_id: Optional[int] = None
+        if role == KVConnectorRole.WORKER and torch.cuda.is_available():
+            try:
+                self._device_id = torch.cuda.current_device()
+            except Exception as exc:
+                logger.warning(
+                    "[PegaKVConnector] Unable to detect CUDA device for worker: %s",
+                    exc,
+                )
+
+        logger.info(
+            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s",
+            role.name,
+            self._instance_id,
+            self._device_id if self._device_id is not None else "cpu",
+        )
+
         # ZMQ client for connecting to engine server (independent process)
         self._engine_endpoint = _ENGINE_ENDPOINT
         self._engine_context: Optional[zmq.Context] = None
@@ -151,6 +180,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._lookup_server_thread: Optional[threading.Thread] = None
         self._lookup_stop_event = threading.Event()
         self._lookup_client = None
+
+        if os.environ.get("PEGAFLOW_KV_LOOKUP_ENDPOINT"):
+            self._lookup_endpoint = _LOOKUP_ENDPOINT
+        else:
+            self._lookup_endpoint = f"ipc:///tmp/pegaflow_kv_lookup_{self._instance_id}.sock"
 
         # Get block size from vllm_config
         self._block_size = vllm_config.cache_config.block_size
@@ -195,6 +229,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         Raises:
             RuntimeError: If request fails or times out
         """
+        payload = dict(payload)
+        payload.setdefault("instance_id", self._instance_id)
+        if self._device_id is not None:
+            payload.setdefault("device_id", self._device_id)
+
         with self._engine_lock:
             try:
                 self._ensure_engine_socket()
@@ -826,6 +865,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         Args:
             kv_caches: Dictionary mapping layer names to KV cache tensors
         """
+        if self._device_id is None:
+            raise RuntimeError(
+                "CUDA device id is unknown; cannot register KV caches without a bound device"
+            )
+
         self._registered_layers = list(kv_caches.keys())
 
         for layer_name, kv_cache in kv_caches.items():
@@ -872,23 +916,26 @@ class PegaKVConnector(KVConnectorBase_V1):
 
             # Send to engine server for registration
             try:
-                self._send_engine_request('REGISTER_CONTEXT', {
+                payload = {
                     'layer_name': layer_name,
                     'wrapper_bytes': wrapper_bytes,
                     'num_blocks': num_blocks,
                     'bytes_per_block': bytes_per_block,
                     'kv_stride_bytes': kv_stride_bytes,
                     'segments': segments,
-                })
+                }
+                payload['device_id'] = self._device_id
+                self._send_engine_request('REGISTER_CONTEXT', payload)
             except Exception as e:
                 raise RuntimeError(
                     f"Failed to register layer {layer_name} with engine: {e}"
                 ) from e
 
         logger.info(
-            "[PegaKVConnector] Registered %d KV cache layers (%s layout)",
+            "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s",
             len(kv_caches),
             layout if kv_caches else "unknown",
+            self._instance_id,
         )
 
     def unregister_context(self) -> None:

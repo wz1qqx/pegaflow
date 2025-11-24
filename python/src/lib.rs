@@ -1,7 +1,7 @@
 use std::sync::Once;
 
 use pega_core::PegaEngine as CoreEngine;
-use pyo3::prelude::*;
+use pyo3::{exceptions::PyRuntimeError, prelude::*};
 use tracing_subscriber::{
     fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
 };
@@ -53,8 +53,9 @@ impl PegaEngine {
     ///     kv_stride_bytes: Byte stride between K and V when KV-first layout is used
     ///     segments: Number of segments per block (1 for blocks-first, 2 for KV-first)
     fn register_context_layer(
-        &self,
-        py: Python<'_>,
+        &mut self,
+        context_id: &str,
+        device_id: i32,
         layer_name: String,
         data_ptr: u64,
         size_bytes: usize,
@@ -62,9 +63,11 @@ impl PegaEngine {
         bytes_per_block: usize,
         kv_stride_bytes: usize,
         segments: usize,
-    ) {
-        py.allow_threads(|| {
-            self.engine.register_context_layer(
+    ) -> PyResult<()> {
+        self.engine
+            .register_context_layer(
+                context_id,
+                device_id,
                 layer_name,
                 data_ptr,
                 size_bytes,
@@ -72,15 +75,15 @@ impl PegaEngine {
                 bytes_per_block,
                 kv_stride_bytes,
                 segments,
-            );
-        })
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Unregister the active inference context
-    fn unregister_context(&self, py: Python<'_>) {
-        py.allow_threads(|| {
-            self.engine.unregister_context();
-        })
+    fn unregister_context(&mut self, context_id: &str) -> PyResult<()> {
+        self.engine
+            .unregister_context(context_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Save KV blocks from GPU via IPC handle to CPU memory
@@ -92,14 +95,23 @@ impl PegaEngine {
     fn save_kv_blocks_from_ipc(
         &self,
         py: Python<'_>,
+        context_id: &str,
         layer_name: String,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
-    ) {
-        py.allow_threads(|| {
-            self.engine
-                .save_kv_blocks_from_ipc(layer_name, block_ids, block_hashes)
+    ) -> PyResult<()> {
+        let context_id_owned = context_id.to_string();
+        let layer_name_owned = layer_name;
+        let engine = &self.engine;
+        py.allow_threads(move || {
+            engine.save_kv_blocks_from_ipc(
+                &context_id_owned,
+                &layer_name_owned,
+                block_ids,
+                block_hashes,
+            )
         })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Count how many blocks from the prefix are available in CPU storage
@@ -113,14 +125,29 @@ impl PegaEngine {
     ///
     /// Returns:
     ///     Number of contiguous blocks available from the prefix (int)
-    fn count_prefix_hit_blocks(&self, py: Python<'_>, block_hashes: Vec<Vec<u8>>) -> usize {
-        py.allow_threads(|| self.engine.count_prefix_hit_blocks(&block_hashes))
+    fn count_prefix_hit_blocks(
+        &self,
+        py: Python<'_>,
+        context_id: &str,
+        block_hashes: Vec<Vec<u8>>,
+    ) -> PyResult<usize> {
+        let context_id_owned = context_id.to_string();
+        let engine = &self.engine;
+        py.allow_threads(move || engine.count_prefix_hit_blocks(&context_id_owned, &block_hashes))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Wait until the async transfer for `layer_name` completes.
-    fn wait_for_layer_transfer(&self, py: Python<'_>, layer_name: String) -> PyResult<()> {
-        py.allow_threads(|| self.engine.wait_for_layer_transfer(&layer_name))
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    fn wait_for_layer_transfer(
+        &self,
+        py: Python<'_>,
+        context_id: &str,
+        layer_name: String,
+    ) -> PyResult<()> {
+        let context_id_owned = context_id.to_string();
+        let engine = &self.engine;
+        py.allow_threads(move || engine.wait_for_layer_transfer(&context_id_owned, &layer_name))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Batch load KV blocks for multiple layers using the same block mapping
@@ -138,30 +165,30 @@ impl PegaEngine {
     fn batch_load_kv_blocks(
         &self,
         py: Python<'_>,
+        context_id: &str,
         layer_names: Vec<String>,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
     ) -> PyResult<(usize, usize)> {
-        py.allow_threads(|| {
-            // Convert Vec<String> to Vec<&str> for the engine call
+        let context_id_owned = context_id.to_string();
+        let engine = &self.engine;
+        py.allow_threads(move || {
             let layer_name_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
-            match self.engine.batch_load_kv_blocks_multi_layer(
-                &layer_name_refs,
-                &block_ids,
-                &block_hashes,
-            ) {
-                Ok(results) => {
+            engine
+                .batch_load_kv_blocks_multi_layer(
+                    &context_id_owned,
+                    &layer_name_refs,
+                    &block_ids,
+                    &block_hashes,
+                )
+                .map(|results| {
                     let total_layers = results.len();
                     let total_bytes = results.iter().map(|(_, bytes)| bytes).sum();
-                    Ok((total_layers, total_bytes))
-                }
-                Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to batch load KV blocks: {}",
-                    e
-                ))),
-            }
+                    (total_layers, total_bytes)
+                })
         })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 }
 

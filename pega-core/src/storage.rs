@@ -1,4 +1,5 @@
 use hashlink::LruCache;
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -156,9 +157,9 @@ unsafe impl Send for Block {}
 unsafe impl Sync for Block {}
 
 pub struct StorageEngine {
-    kv_storage: Mutex<LruCache<BlockHash, Arc<LayerBlocksWithWeight>>>,
+    kv_storage: Mutex<LruCache<BlockHash, Arc<ContextualLayerBlocks>>>,
     pinned_pool: Arc<PinnedMemoryPool>,
-    layer_count: Mutex<Option<usize>>,
+    context_layer_counts: Mutex<HashMap<String, usize>>,
 }
 
 impl StorageEngine {
@@ -171,7 +172,7 @@ impl StorageEngine {
         Self {
             kv_storage,
             pinned_pool,
-            layer_count: Mutex::new(None),
+            context_layer_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -214,38 +215,39 @@ impl StorageEngine {
         freed_entries
     }
 
-    pub fn initialize_layer_count(&self, total_layers: usize) {
+    pub fn initialize_layer_count(&self, context_id: &str, total_layers: usize) {
         if total_layers == 0 {
             panic!("total_layers must be > 0");
         }
-        let mut guard = self.layer_count.lock().unwrap();
-        match *guard {
-            Some(existing) if existing != total_layers => {
+        let mut guard = self.context_layer_counts.lock().unwrap();
+        match guard.get(context_id) {
+            Some(existing) if *existing != total_layers => {
                 panic!(
-                    "layer count changed: expected {}, got {}",
-                    existing, total_layers
+                    "layer count changed for context {}: expected {}, got {}",
+                    context_id, existing, total_layers
                 )
             }
             Some(_) => {}
             None => {
-                *guard = Some(total_layers);
+                guard.insert(context_id.to_string(), total_layers);
             }
         }
     }
 
-    fn get_layer_count(&self) -> usize {
+    fn get_layer_count(&self, context_id: &str) -> usize {
         *self
-            .layer_count
+            .context_layer_counts
             .lock()
             .unwrap()
-            .as_ref()
-            .expect("layer count not initialized")
+            .get(context_id)
+            .unwrap_or_else(|| panic!("layer count not initialized for context {}", context_id))
     }
 
-    pub fn layer_has_block(&self, block_hash: &[u8], layer_id: usize) -> bool {
+    pub fn layer_has_block(&self, context_id: &str, block_hash: &[u8], layer_id: usize) -> bool {
         let mut cache = self.kv_storage.lock().unwrap();
         cache
             .get(block_hash)
+            .and_then(|entry| entry.get_context(context_id))
             .map(|blocks| {
                 let blocks = blocks.lock_blocks();
                 blocks.get(layer_id).and_then(|opt| opt.as_ref()).is_some()
@@ -253,29 +255,37 @@ impl StorageEngine {
             .unwrap_or(false)
     }
 
-    pub fn block_is_complete(&self, block_hash: &[u8]) -> bool {
+    pub fn block_is_complete(&self, context_id: &str, block_hash: &[u8]) -> bool {
         let mut cache = self.kv_storage.lock().unwrap();
         cache
             .get(block_hash)
+            .and_then(|entry| entry.get_context(context_id))
             .map(|blocks| blocks.is_complete())
             .unwrap_or(false)
     }
 
-    pub fn insert_block(&self, block_hash: BlockHash, layer_id: usize, block: Arc<Block>) {
-        let total_layers = self.get_layer_count();
+    pub fn insert_block(
+        &self,
+        context_id: &str,
+        block_hash: BlockHash,
+        layer_id: usize,
+        block: Arc<Block>,
+    ) {
+        let total_layers = self.get_layer_count(context_id);
         let mut cache = self.kv_storage.lock().unwrap();
-        // TODO: we may need check if layer_id == 0 here
         let entry = cache.get(&block_hash).cloned().unwrap_or_else(|| {
-            let new_blocks = Arc::new(LayerBlocksWithWeight::new(total_layers));
+            let new_blocks = Arc::new(ContextualLayerBlocks::new());
             cache.insert(block_hash.clone(), Arc::clone(&new_blocks));
             new_blocks
         });
-        let mut blocks = entry.lock_blocks();
+        let context_blocks = entry.get_or_insert_context(context_id, total_layers);
+        let mut blocks = context_blocks.lock_blocks();
         blocks.mark_layer_ready(layer_id, block);
     }
 
-    pub fn lookup_many(
+    pub fn lookup_many_for_context(
         &self,
+        context_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<Vec<Arc<LayerBlocksWithWeight>>, String> {
         let mut cache = self.kv_storage.lock().unwrap();
@@ -285,8 +295,79 @@ impl StorageEngine {
                 .get(hash)
                 .cloned()
                 .ok_or_else(|| "Missing KV block hash".to_string())?;
-            result.push(layer_blocks);
+            let context_blocks = layer_blocks
+                .get_context(context_id)
+                .ok_or_else(|| "Missing KV blocks for context".to_string())?;
+            result.push(context_blocks);
         }
         Ok(result)
+    }
+
+    pub fn clear_context(&self, context_id: &str) {
+        self.context_layer_counts.lock().unwrap().remove(context_id);
+
+        let mut cache = self.kv_storage.lock().unwrap();
+        let keys: Vec<BlockHash> = cache.iter().map(|(k, _)| k.clone()).collect();
+        for key in keys {
+            let should_remove = if let Some(entry) = cache.get(&key) {
+                if entry.remove_context(context_id) {
+                    entry.is_empty()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_remove {
+                cache.remove(&key);
+            }
+        }
+    }
+}
+
+struct ContextualLayerBlocks {
+    contexts: Mutex<HashMap<String, Arc<LayerBlocksWithWeight>>>,
+}
+
+impl ContextualLayerBlocks {
+    fn new() -> Self {
+        Self {
+            contexts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get_or_insert_context(
+        &self,
+        context_id: &str,
+        total_layers: usize,
+    ) -> Arc<LayerBlocksWithWeight> {
+        let mut guard = self.contexts.lock().expect("context map poisoned");
+        guard
+            .entry(context_id.to_string())
+            .or_insert_with(|| Arc::new(LayerBlocksWithWeight::new(total_layers)))
+            .clone()
+    }
+
+    fn get_context(&self, context_id: &str) -> Option<Arc<LayerBlocksWithWeight>> {
+        self.contexts
+            .lock()
+            .expect("context map poisoned")
+            .get(context_id)
+            .cloned()
+    }
+
+    fn remove_context(&self, context_id: &str) -> bool {
+        self.contexts
+            .lock()
+            .expect("context map poisoned")
+            .remove(context_id)
+            .is_some()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.contexts
+            .lock()
+            .expect("context map poisoned")
+            .is_empty()
     }
 }
