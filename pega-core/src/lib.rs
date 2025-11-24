@@ -1,5 +1,6 @@
 pub mod allocator;
 pub mod pinned_pool;
+mod storage;
 mod transfer;
 
 pub use pinned_pool::PinnedAllocation;
@@ -27,37 +28,16 @@ pub use pinned_pool::PinnedAllocation;
 // ============================================================================
 
 use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
-use hashlink::LruCache;
 use std::{
     collections::HashMap,
-    ptr::NonNull,
     sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 use tracing::{debug, info, instrument};
 
-use crate::pinned_pool::PinnedMemoryPool;
+use crate::storage::{Block, StorageEngine};
 
 const DEFAULT_PINNED_POOL_BYTES: usize = 20 * 1024 * 1024 * 1024; // 10GB
-
-type BlockHash = Vec<u8>;
-
-/// A vector of blocks for all layers, indexed by layer_id
-/// Each entry is Option<Arc<Block>> to support partial layer storage
-type LayerBlocks = Vec<Option<Arc<Block>>>;
-
-/// Wrapper for LayerBlocks with fixed weight for cache eviction
-struct LayerBlocksWithWeight {
-    blocks: Mutex<LayerBlocks>,
-}
-
-impl LayerBlocksWithWeight {
-    fn new(num_layers: usize) -> Self {
-        Self {
-            blocks: Mutex::new(vec![None; num_layers]),
-        }
-    }
-}
 
 pub struct PegaEngine {
     /// Store registered KV cache pointers (new IPC wrapper): layer_name -> registration
@@ -69,11 +49,8 @@ pub struct PegaEngine {
     /// Ordered list of layer names (layer_id is the index into this vec)
     /// Wrapped in RwLock for thread-safe registration with concurrent reads
     layer_names: RwLock<Vec<String>>,
-    /// Store saved KV blocks: block_hash -> Vec<Option<Arc<Block>>> (one per layer)
-    /// LruCache is wrapped in Mutex for thread-safe access
-    kv_storage: Mutex<LruCache<BlockHash, Arc<LayerBlocksWithWeight>>>,
-    /// Pinned memory pool for zero-copy GPU transfers
-    pinned_pool: Arc<PinnedMemoryPool>,
+    /// Storage engine responsible for pinned allocations + block cache
+    storage: StorageEngine,
     /// Single stream for all transfers to ensure sequential execution (Layer0 -> Layer1...)
     stream: Arc<CudaStream>,
     /// Track per-layer completion events for async loading
@@ -94,64 +71,6 @@ pub struct KVCacheRegistration {
     pub segments: usize,
 }
 
-pub struct Block {
-    /// Pointer to K segment (or combined data if contiguous)
-    k_ptr: NonNull<u8>,
-    /// Pointer to V segment (if stored separately)
-    v_ptr: Option<NonNull<u8>>,
-    size: usize,
-    /// Shared RAII allocation handle for K memory (automatically freed when last reference drops)
-    #[allow(dead_code)]
-    k_allocation: Arc<PinnedAllocation>,
-    /// Shared RAII allocation handle for V memory (if separate from K)
-    #[allow(dead_code)]
-    v_allocation: Option<Arc<PinnedAllocation>>,
-}
-
-impl Block {
-    fn new_contiguous(ptr: *mut u8, size: usize, allocation: Arc<PinnedAllocation>) -> Self {
-        Self {
-            k_ptr: unsafe { NonNull::new_unchecked(ptr) },
-            v_ptr: None,
-            size,
-            k_allocation: allocation,
-            v_allocation: None,
-        }
-    }
-
-    fn new_split(
-        k_ptr: *mut u8,
-        v_ptr: *mut u8,
-        size: usize,
-        k_allocation: Arc<PinnedAllocation>,
-        v_allocation: Arc<PinnedAllocation>,
-    ) -> Self {
-        Self {
-            k_ptr: unsafe { NonNull::new_unchecked(k_ptr) },
-            v_ptr: Some(unsafe { NonNull::new_unchecked(v_ptr) }),
-            size,
-            k_allocation,
-            v_allocation: Some(v_allocation),
-        }
-    }
-
-    fn k_ptr(&self) -> *mut u8 {
-        self.k_ptr.as_ptr()
-    }
-
-    fn v_ptr(&self) -> Option<*mut u8> {
-        self.v_ptr.map(|ptr| ptr.as_ptr())
-    }
-
-    fn size(&self) -> usize {
-        self.size
-    }
-}
-
-// TODO: Add safety comments, it is a bit tricky
-unsafe impl Send for Block {}
-unsafe impl Sync for Block {}
-
 impl PegaEngine {
     /// Create a new PegaEngine instance
     #[instrument(level = "info")]
@@ -161,11 +80,7 @@ impl PegaEngine {
 
     /// Create a new PegaEngine instance with a custom pinned memory pool size
     pub fn new_with_pool_size(pool_size: usize) -> Self {
-        let pinned_pool = Arc::new(PinnedMemoryPool::new(pool_size));
-        // Use 100% of pool size as cache capacity (manual eviction will handle OOM)
-        let cache_capacity = pool_size.max(1);
-        let kv_storage = Mutex::new(LruCache::new(cache_capacity));
-
+        let storage = StorageEngine::new(pool_size);
         // TODO: hard code device 0 for now
         let cuda_ctx = cudarc::driver::CudaContext::new(0).unwrap();
         let stream = cuda_ctx.new_stream().expect("Failed to create stream");
@@ -174,9 +89,8 @@ impl PegaEngine {
             kv_caches: RwLock::new(HashMap::new()),
             layer_name_to_id: RwLock::new(HashMap::new()),
             layer_names: RwLock::new(Vec::new()),
-            kv_storage,
-            pinned_pool,
-            stream: stream,
+            storage,
+            stream,
             layer_events: Mutex::new(HashMap::new()),
             _cuda_ctx: cuda_ctx,
         }
@@ -246,48 +160,6 @@ impl PegaEngine {
         layer_names.clear();
     }
 
-    /// Allocate pinned memory from the pool. Returns RAII guard. Panics when the allocation cannot be satisfied.
-    fn allocate_pinned(&self, size: usize) -> PinnedAllocation {
-        // Try to allocate, with automatic LRU eviction on failure
-        loop {
-            if let Some(allocation) = self.pinned_pool.allocate(size) {
-                return allocation;
-            }
-
-            // Allocation failed, try to evict multiple LRU entries from cache at once
-            // Batch eviction reduces lock contention and loop iterations
-            const BATCH_EVICT_COUNT: usize = 128;
-            let mut evicted_count = 0;
-            {
-                let mut cache = self.kv_storage.lock().unwrap();
-                for _ in 0..BATCH_EVICT_COUNT {
-                    if cache.remove_lru().is_some() {
-                        evicted_count += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            if evicted_count > 0 {
-                info!(
-                    "Pinned memory pool exhausted, evicted {} LRU entries in batch",
-                    evicted_count
-                );
-                continue;
-            } else {
-                // Cache is empty, but still can't allocate - genuine OOM
-                let (used, total) = self.pinned_pool.usage();
-                panic!(
-                    "Pinned memory pool exhausted! Requested: {:.2} MB, Used: {:.2} MB, Total: {:.2} MB, Cache empty",
-                    size as f64 / 1e6,
-                    used as f64 / 1e6,
-                    total as f64 / 1e6
-                );
-            }
-        }
-    }
-
     /// Get the layer_id for a given layer_name
     fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
         let layer_name_to_id = self
@@ -301,11 +173,6 @@ impl PegaEngine {
     fn num_layers(&self) -> usize {
         let layer_names = self.layer_names.read().expect("layer_names lock poisoned");
         layer_names.len()
-    }
-
-    /// Create a new LayerBlocksWithWeight
-    fn new_layer_blocks(&self) -> Arc<LayerBlocksWithWeight> {
-        Arc::new(LayerBlocksWithWeight::new(self.num_layers()))
     }
 
     fn record_layer_event(&self, layer_name: &str, event: CudaEvent) {
@@ -361,14 +228,7 @@ impl PegaEngine {
             );
 
             // Check if this block_hash already has data for this layer
-            let needs_save = if let Some(layer_blocks) =
-                self.kv_storage.lock().unwrap().get(block_hash).cloned()
-            {
-                let blocks = layer_blocks.blocks.lock().unwrap();
-                blocks.get(layer_id).and_then(|opt| opt.as_ref()).is_none()
-            } else {
-                true
-            };
+            let needs_save = !self.storage.layer_has_block(block_hash, layer_id);
 
             if needs_save {
                 blocks_to_save.push((block_idx, block_hash.clone()));
@@ -380,6 +240,7 @@ impl PegaEngine {
         }
 
         let block_size = transfer::block_size(&registration).unwrap();
+        self.storage.initialize_layer_count(self.num_layers());
         let num_blocks = blocks_to_save.len();
 
         // For layer-first layout with KV stride, allocate separate regions for K and V
@@ -390,12 +251,10 @@ impl PegaEngine {
             let v_total_size = segment_size * num_blocks;
 
             // Allocate separate regions for K and V segments
-            let k_allocation = self.allocate_pinned(k_total_size);
-            let v_allocation = self.allocate_pinned(v_total_size);
+            let k_allocation = self.storage.allocate(k_total_size);
+            let v_allocation = self.storage.allocate(v_total_size);
             let k_base_ptr = k_allocation.as_mut_ptr();
             let v_base_ptr = v_allocation.as_mut_ptr();
-            let k_shared_allocation = Arc::new(k_allocation);
-            let v_shared_allocation = Arc::new(v_allocation);
 
             // Calculate GPU offsets for batching
             let mut k_offsets_with_idx = Vec::with_capacity(num_blocks);
@@ -441,29 +300,17 @@ impl PegaEngine {
                     k_ptr,
                     v_ptr,
                     block_size,
-                    Arc::clone(&k_shared_allocation),
-                    Arc::clone(&v_shared_allocation),
+                    Arc::clone(&k_allocation),
+                    Arc::clone(&v_allocation),
                 ));
 
-                // Insert or update the LayerBlocks for this block_hash
-                let layer_blocks = {
-                    let mut cache = self.kv_storage.lock().unwrap();
-                    cache.get(&block_hash).cloned().unwrap_or_else(|| {
-                        let new_blocks = self.new_layer_blocks();
-                        cache.insert(block_hash.clone(), Arc::clone(&new_blocks));
-                        new_blocks
-                    })
-                };
-
-                let mut blocks = layer_blocks.blocks.lock().unwrap();
-                blocks[layer_id] = Some(block);
+                self.storage.insert_block(block_hash, layer_id, block);
             }
         } else {
             // Original logic for contiguous or single-segment layouts
             let total_size = block_size * num_blocks;
-            let allocation = self.allocate_pinned(total_size);
+            let allocation = self.storage.allocate(total_size);
             let base_ptr = allocation.as_mut_ptr();
-            let shared_allocation = Arc::new(allocation);
 
             // Copy blocks and create Block objects
             for (i, (block_idx, block_hash)) in blocks_to_save.into_iter().enumerate() {
@@ -473,21 +320,10 @@ impl PegaEngine {
                 let block = Arc::new(Block::new_contiguous(
                     cpu_ptr,
                     block_size,
-                    Arc::clone(&shared_allocation),
+                    Arc::clone(&allocation),
                 ));
 
-                // Insert or update the LayerBlocks for this block_hash
-                let layer_blocks = {
-                    let mut cache = self.kv_storage.lock().unwrap();
-                    cache.get(&block_hash).cloned().unwrap_or_else(|| {
-                        let new_blocks = self.new_layer_blocks();
-                        cache.insert(block_hash.clone(), Arc::clone(&new_blocks));
-                        new_blocks
-                    })
-                };
-
-                let mut blocks = layer_blocks.blocks.lock().unwrap();
-                blocks[layer_id] = Some(block);
+                self.storage.insert_block(block_hash, layer_id, block);
             }
         }
     }
@@ -496,7 +332,7 @@ impl PegaEngine {
     ///
     /// Returns the number of contiguous blocks available from the start.
     /// Stops counting at the first unavailable block.
-    /// Uses the first registered layer (layer_id = 0) for availability check.
+    /// Uses the per-block completion status so schedulers only see fully saved blocks.
     ///
     /// Args:
     ///   - block_hashes: List of block hashes to check
@@ -510,26 +346,14 @@ impl PegaEngine {
         ret
     )]
     pub fn count_prefix_hit_blocks(&self, block_hashes: &[Vec<u8>]) -> usize {
-        // Use first layer for availability check (layer_id = 0)
-        // If no layers registered, all blocks are unavailable
         if self.num_layers() == 0 {
             return 0;
         }
 
-        let layer_id = 0;
         let mut hit_count = 0;
 
         for block_hash in block_hashes.iter() {
-            let available = if let Some(layer_blocks) =
-                self.kv_storage.lock().unwrap().get(block_hash).cloned()
-            {
-                let blocks = layer_blocks.blocks.lock().unwrap();
-                blocks.get(layer_id).and_then(|opt| opt.as_ref()).is_some()
-            } else {
-                false
-            };
-
-            if !available {
+            if !self.storage.block_is_complete(block_hash) {
                 break;
             }
             hit_count += 1;
@@ -574,24 +398,10 @@ impl PegaEngine {
         let start_time = Instant::now();
 
         // Step 1: Lookup all block_hashes ONCE and cache the LayerBlocks
-        let mut layer_blocks_cache = Vec::with_capacity(block_hashes.len());
-        {
-            let mut cache = self.kv_storage.lock().unwrap();
-            for block_hash in block_hashes {
-                let layer_blocks = cache
-                    .get(block_hash)
-                    .cloned()
-                    .ok_or_else(|| format!("Missing KV block hash"))?;
-                layer_blocks_cache.push(layer_blocks);
-            }
-        }
-
-        let lookup_time = Instant::now();
-        info!(
-            "batch_load_kv_blocks_multi_layer: lookup time: {} us (for {} blocks)",
-            (lookup_time - start_time).as_micros(),
-            block_hashes.len()
-        );
+        let layer_blocks_cache = self
+            .storage
+            .lookup_many(block_hashes)
+            .map_err(|e| format!("Failed to lookup KV blocks: {e}"))?;
 
         // Step 2: For each layer, extract blocks and perform transfer
         let mut results = Vec::with_capacity(layer_names.len());
@@ -625,7 +435,7 @@ impl PegaEngine {
             for (block_id, layer_blocks_arc) in block_ids.iter().zip(layer_blocks_cache.iter()) {
                 let block_idx = *block_id as usize;
 
-                let blocks = layer_blocks_arc.blocks.lock().unwrap();
+                let blocks = layer_blocks_arc.lock_blocks();
                 if let Some(block) = blocks.get(layer_id).and_then(|opt| opt.as_ref()) {
                     blocks_to_load.push((block_idx, block.clone()));
                 }

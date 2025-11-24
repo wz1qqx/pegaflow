@@ -113,11 +113,7 @@ impl PegaEngine {
     ///
     /// Returns:
     ///     Number of contiguous blocks available from the prefix (int)
-    fn count_prefix_hit_blocks(
-        &self,
-        py: Python<'_>,
-        block_hashes: Vec<Vec<u8>>,
-    ) -> usize {
+    fn count_prefix_hit_blocks(&self, py: Python<'_>, block_hashes: Vec<Vec<u8>>) -> usize {
         py.allow_threads(|| self.engine.count_prefix_hit_blocks(&block_hashes))
     }
 
