@@ -38,9 +38,7 @@ impl LayerBlocksState {
             self.blocks.len()
         );
         self.blocks[layer_id] = Some(block);
-        if layer_id == self.blocks.len() - 1 {
-            self.is_complete = true;
-        }
+        self.is_complete = self.blocks.iter().all(|opt| opt.is_some());
     }
 }
 

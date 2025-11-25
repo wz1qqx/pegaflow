@@ -117,8 +117,8 @@ impl PegaEngine {
     /// Count how many blocks from the prefix are available in CPU storage
     ///
     /// Returns the number of contiguous blocks available from the start.
-    /// Stops counting at the first unavailable block.
-    /// Uses the first registered layer (layer_id = 0) for availability check.
+    /// Stops counting at the first unavailable block by inspecting the
+    /// CPU cache completion status directly (no GPU context required).
     ///
     /// Args:
     ///     block_hashes: List of block hashes to check (list of bytes)
@@ -128,12 +128,10 @@ impl PegaEngine {
     fn count_prefix_hit_blocks(
         &self,
         py: Python<'_>,
-        context_id: &str,
         block_hashes: Vec<Vec<u8>>,
     ) -> PyResult<usize> {
-        let context_id_owned = context_id.to_string();
         let engine = &self.engine;
-        py.allow_threads(move || engine.count_prefix_hit_blocks(&context_id_owned, &block_hashes))
+        py.allow_threads(move || engine.count_prefix_hit_blocks(&block_hashes))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 

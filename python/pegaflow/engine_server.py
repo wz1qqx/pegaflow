@@ -337,10 +337,9 @@ class PegaEngineServer:
             or {'status': 'error', 'message': str}
         """
         try:
-            context_id = self._require_context_id(payload)
             block_hashes = payload['block_hashes']
 
-            hit_blocks = self.engine.count_prefix_hit_blocks(context_id, block_hashes)
+            hit_blocks = self.engine.count_prefix_hit_blocks(block_hashes)
 
             return {
                 'status': 'success',

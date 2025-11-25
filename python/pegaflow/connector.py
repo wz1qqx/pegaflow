@@ -82,11 +82,6 @@ if not logger.hasHandlers():
     # Prevent duplicate output while using the fallback handler.
     logger.propagate = False
 
-_LOOKUP_ENDPOINT = os.environ.get("PEGAFLOW_KV_LOOKUP_ENDPOINT")
-if _LOOKUP_ENDPOINT is None:
-    unique_id = getattr(os, "getuid", os.getpid)()
-    _LOOKUP_ENDPOINT = f"ipc:///tmp/pegaflow_kv_lookup_{unique_id}.sock"
-
 # Engine server endpoint (independent process)
 _ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT", "ipc:///tmp/pega_engine.sock")
 
@@ -203,30 +198,12 @@ class PegaKVConnector(KVConnectorBase_V1):
         # Track registered KV cache layers
         self._registered_layers: list[str] = []
 
-        # Scheduler/worker lookup channel state
-        self._lookup_endpoint = _LOOKUP_ENDPOINT
-        self._lookup_context: Optional[zmq.Context] = None
-        self._lookup_server_socket = None
-        self._lookup_server_thread: Optional[threading.Thread] = None
-        self._lookup_stop_event = threading.Event()
-        self._lookup_client = None
-
-        if os.environ.get("PEGAFLOW_KV_LOOKUP_ENDPOINT"):
-            self._lookup_endpoint = _LOOKUP_ENDPOINT
-        else:
-            self._lookup_endpoint = f"ipc:///tmp/pegaflow_kv_lookup_{self._instance_id}.sock"
-
         # Get block size from vllm_config
         self._block_size = vllm_config.cache_config.block_size
         # NOTE: KV cache layout is detected in register_kv_caches() by checking tensor shape.
         # vLLM uses KV-first layout: (2, num_blocks, block_size, num_heads, head_dim)
         # where the first dimension (2) represents K and V separately.
 
-        # Only worker rank 0 needs to host the lookup server
-        parallel_config = getattr(vllm_config, "parallel_config", None)
-        data_parallel_rank = getattr(parallel_config, "data_parallel_rank", 0)
-        if role == KVConnectorRole.WORKER and data_parallel_rank == 0:
-            self._start_lookup_server()
 
     # ==============================
     # Engine client helper methods
@@ -616,7 +593,20 @@ class PegaKVConnector(KVConnectorBase_V1):
         num_tokens = len(prompt_token_ids)
         block_hashes = request.block_hashes
 
-        matched_blocks = self._send_lookup_request(req_id, block_hashes)
+        lookup_start = time.perf_counter()
+        matched_blocks = self._count_available_block_prefix(block_hashes)
+        lookup_end = time.perf_counter()
+
+        total_blocks = len(block_hashes)
+        elapsed_us = (lookup_end - lookup_start) * 1e6
+        logger.info(
+            "[PegaKVConnector] scheduler_lookup req=%s hit_blocks=%d/%d (%.1f%%) cost=%.0f us",
+            req_id,
+            matched_blocks,
+            total_blocks,
+            (matched_blocks / total_blocks * 100) if total_blocks > 0 else 0.0,
+            elapsed_us,
+        )
         if matched_blocks <= 0:
             return (0, False)
 
@@ -753,62 +743,6 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         return metadata
 
-    def _start_lookup_server(self) -> None:
-        """Start background REP server for scheduler lookup requests."""
-        if self._lookup_server_thread is not None:
-            return
-
-        self._lookup_context = zmq.Context()
-        self._lookup_stop_event.clear()
-        self._lookup_server_socket = self._lookup_context.socket(zmq.REP)
-
-        if self._lookup_endpoint.startswith("ipc://"):
-            ipc_path = self._lookup_endpoint.replace("ipc://", "")
-            try:
-                os.unlink(ipc_path)
-            except FileNotFoundError:
-                pass
-            except PermissionError:
-                pass
-
-        self._lookup_server_socket.bind(self._lookup_endpoint)
-
-        thread = threading.Thread(target=self._lookup_server_loop, daemon=True)
-        thread.start()
-        self._lookup_server_thread = thread
-        logger.info(
-            "[PegaKVConnector] Lookup server started at %s",
-            self._lookup_endpoint,
-        )
-
-    def _lookup_server_loop(self) -> None:
-        """Handle lookup requests from the scheduler."""
-        assert self._lookup_server_socket is not None
-
-        while not self._lookup_stop_event.is_set():
-            try:
-                message = self._lookup_server_socket.recv()
-            except zmq.error.ZMQError:
-                if self._lookup_stop_event.is_set():
-                    break
-                continue
-
-            hit_blocks = 0
-            try:
-                # Directly deserialize block_hashes list for faster deserialization
-                block_hashes = msgpack.unpackb(message)
-                hit_blocks = self._count_available_block_prefix(block_hashes)
-            except Exception:
-                hit_blocks = 0
-
-            # Directly serialize hit_blocks int for faster serialization
-            reply = msgpack.packb(hit_blocks)
-            try:
-                self._lookup_server_socket.send(reply)
-            except zmq.error.ZMQError:
-                if self._lookup_stop_event.is_set():
-                    break
-
     def _count_available_block_prefix(self, block_hashes: List[bytes]) -> int:
         """Return length of contiguous prefix available in CPU storage."""
         if not block_hashes:
@@ -821,73 +755,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             return response.get('hit_blocks', 0)
         except Exception:
             return 0
-
-    def _ensure_lookup_client(self) -> None:
-        if self._lookup_client is not None:
-            return
-        if self._lookup_context is None:
-            self._lookup_context = zmq.Context()
-        self._lookup_client = self._lookup_context.socket(zmq.REQ)
-        # Avoid hanging forever if worker is not reachable
-        self._lookup_client.setsockopt(zmq.RCVTIMEO, 2000)
-        self._lookup_client.setsockopt(zmq.SNDTIMEO, 2000)
-        self._lookup_client.connect(self._lookup_endpoint)
-
-    def _send_lookup_request(self, req_id: str, block_hashes: List[bytes]) -> int:
-        """Query worker for contiguous cached prefix length (in blocks)."""
-        if not block_hashes:
-            return 0
-
-        try:
-            self._ensure_lookup_client()
-        except Exception:
-            return 0
-
-        # Directly serialize block_hashes list for faster serialization
-        payload = msgpack.packb(block_hashes)
-
-        lookup_start = time.perf_counter()
-        try:
-            assert self._lookup_client is not None
-            self._lookup_client.send(payload)
-            reply = self._lookup_client.recv()
-        except (zmq.error.Again, zmq.error.ZMQError):
-            return 0
-        lookup_end = time.perf_counter()
-
-        try:
-            # Directly deserialize hit_blocks int for faster deserialization
-            hit_blocks = int(msgpack.unpackb(reply))
-        except Exception:
-            return 0
-
-        total_blocks = len(block_hashes)
-        elapsed_us = (lookup_end - lookup_start) * 1e6
-        logger.info(
-            "[PegaKVConnector] scheduler_lookup req=%s hit_blocks=%d/%d (%.1f%%) cost=%.0f us",
-            req_id,
-            hit_blocks,
-            total_blocks,
-            (hit_blocks / total_blocks * 100) if total_blocks > 0 else 0.0,
-            elapsed_us,
-        )
-        return hit_blocks
-
-    def _stop_lookup_server(self) -> None:
-        if self._lookup_server_thread is None:
-            return
-        self._lookup_stop_event.set()
-        if self._lookup_server_socket is not None:
-            try:
-                self._lookup_server_socket.close(0)
-            except Exception:
-                pass
-            self._lookup_server_socket = None
-        self._lookup_server_thread.join(timeout=1.0)
-        self._lookup_server_thread = None
-        if self._lookup_context is not None:
-            self._lookup_context.term()
-            self._lookup_context = None
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the active inference context with the engine service.
@@ -987,7 +854,6 @@ class PegaKVConnector(KVConnectorBase_V1):
     def shutdown(self):
         """Shutdown the connector and unregister all KV caches."""
         self.unregister_context()
-        self._stop_lookup_server()
 
         # Shutdown engine connection
         if self._engine_socket is not None:
@@ -999,26 +865,12 @@ class PegaKVConnector(KVConnectorBase_V1):
                 pass
             self._engine_socket = None
 
-        if self._lookup_client is not None:
-            try:
-                self._lookup_client.close(0)
-            except Exception:
-                pass
-            self._lookup_client = None
-
         if self._engine_context is not None:
             try:
                 self._engine_context.term()
             except Exception:
                 pass
             self._engine_context = None
-
-        if self._lookup_context is not None:
-            try:
-                self._lookup_context.term()
-            except Exception:
-                pass
-            self._lookup_context = None
 
 
 __all__ = ["PegaKVConnector", "KVConnectorRole"]

@@ -460,16 +460,7 @@ impl PegaEngine {
         fields(requested = %block_hashes.len()),
         ret
     )]
-    pub fn count_prefix_hit_blocks(
-        &self,
-        context_id: &str,
-        block_hashes: &[Vec<u8>],
-    ) -> Result<usize, EngineError> {
-        let total_layers = self.with_context(context_id, |ctx| Ok(ctx.num_layers()))?;
-        if total_layers == 0 {
-            return Ok(0);
-        }
-
+    pub fn count_prefix_hit_blocks(&self, block_hashes: &[Vec<u8>]) -> Result<usize, EngineError> {
         let mut hit_count = 0;
 
         for block_hash in block_hashes.iter() {
