@@ -1,32 +1,17 @@
 from __future__ import annotations
 
-"""Baseline vLLM v1 KV connector for local development.
+"""PegaFlow KV connector for vLLM v1.
 
-This module defines :class:`PegaKVConnector`, a thin subclass of
+This module defines :class:`PegaKVConnector`, a subclass of
 ``vllm.distributed.kv_transfer.kv_connector.v1.base.KVConnectorBase_V1``.
-
-At the moment it only mirrors the abstract API and raises
-``NotImplementedError`` in all required methods, so that we have a
-self-contained place inside this repo to start iterating on our own
-PegaFlow-backed connector implementation.
-
-Usage example (scheduler/worker side)::
-
-    from pegaflow import PegaKVConnector, KVConnectorRole
-
-    connector = PegaKVConnector(vllm_config, KVConnectorRole.WORKER)
-
-Later we can register this class as a dynamic connector in vLLM by
-referencing it via its full import path.
 """
 
-import functools
-import logging
 import os
 import pickle
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from typing import Any, Dict, List, Optional, Tuple
 
 import msgpack
@@ -40,62 +25,22 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
-# Import CUDA IPC wrapper for cross-process tensor sharing
 from pegaflow.ipc_wrapper import CudaIPCWrapper
-
-# Import PyLayerSyncState for shared-memory based layer synchronization
+from pegaflow.logging_utils import get_connector_logger, timing_wrapper
 from pegaflow.pegaflow import PyLayerSyncState
 
-logger = logging.getLogger(__name__)
-# Enable INFO logs by default so required operational logs are visible even if
-# the host application doesn't configure logging.
-logger.setLevel(logging.INFO)
-
-# Environment variable to control timing logging
-_ENABLE_TIMING = os.environ.get("PEGAFLOW_ENABLE_TIMING", "0") == "1"
-
-
-def timing_wrapper(func):
-    """Decorator to log function name and execution time when enabled.
-
-    Enable by setting environment variable: PEGAFLOW_ENABLE_TIMING=1
-    """
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        if not _ENABLE_TIMING:
-            return func(*args, **kwargs)
-
-        start = time.perf_counter()
-        try:
-            result = func(*args, **kwargs)
-            return result
-        finally:
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.info(
-                "[PegaKVConnector] %s took %.2f ms",
-                func.__name__,
-                elapsed_ms,
-            )
-    return wrapper
-
-if not logger.hasHandlers():
-    _handler = logging.StreamHandler()
-    _handler.setLevel(logging.NOTSET)
-    _handler.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(_handler)
-    # Prevent duplicate output while using the fallback handler.
-    logger.propagate = False
+logger = get_connector_logger()
 
 # Engine server endpoint (independent process)
 _ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT", "ipc:///tmp/pega_engine.sock")
 
 
 class PegaConnectorMetadata(KVConnectorMetadata):
-    """Metadata for PegaFlow KV connector.
+    """
+    Metadata for PegaFlow KV connector.
 
-    Contains information needed to save/load KV cache blocks:
-    - block_hashes: content hashes for each block
-    - requests_to_load: mapping from request ID to load information
+    Abstract Metadata used to communicate between the
+    Scheduler KVConnector and Worker KVConnector.
     """
 
     def __init__(
@@ -107,52 +52,45 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         self.block_hashes = block_hashes or {}
         self.requests_to_load = requests_to_load or {}
 
-class PegaKVConnector(KVConnectorBase_V1):
-    """Skeleton v1 KV connector for PegaFlow.
 
-    This class intentionally keeps the same method signatures as
-    :class:`KVConnectorBase_V1` so that it can be used as a drop-in
-    implementation once we fill in the logic. All abstract methods
-    currently raise :class:`NotImplementedError`.
+class PegaKVConnector(KVConnectorBase_V1):
+    """
+    v1 KV connector for PegaFlow.
+
+    The class provides the following primitives:
+        Scheduler-side: runs in the scheduler, binds metadata, which
+        is used by the worker-side to load/save KV cache.
+            get_num_new_matched_tokens() - IMPLEMENTED
+            update_state_after_alloc() - IMPLEMENTED
+            build_connector_meta() - IMPLEMENTED
+            update_connector_output() - NOT IMPLEMENTED (uses base default)
+            request_finished() - NOT IMPLEMENTED (uses base default: returns False, None)
+            take_events() - NOT IMPLEMENTED (uses base default: returns empty tuple)
+
+        Worker-side: runs in each worker, loads/saves KV cache to/from
+        the Connector based on the metadata.
+            start_load_kv() - IMPLEMENTED
+            wait_for_layer_load() - IMPLEMENTED
+            save_kv_layer() - IMPLEMENTED
+            wait_for_save() - IMPLEMENTED
+            get_finished() - NOT IMPLEMENTED (uses base default: returns None, None)
+            register_kv_caches() - IMPLEMENTED (PegaFlow-specific)
     """
 
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        """Create a new PegaKVConnector.
-
-        Args:
-            vllm_config: vLLM configuration object.
-            role: Whether this connector instance runs in the scheduler
-                process or the worker process.
-        """
         super().__init__(vllm_config, role)
 
         # Determine instance_id with DP rank support
-        # Priority:
-        # 1. kv_transfer_config.engine_id (already includes _dp{rank} suffix if DP is enabled)
-        # 2. vllm_config.instance_id or PEGAFLOW_INSTANCE_ID env var (need to append DP rank)
-        # 3. Generate a new UUID (need to append DP rank)
-
-        # Use kv_transfer_config.engine_id if available (already has DP rank suffix)
         instance_id = vllm_config.kv_transfer_config.engine_id
         if instance_id:
-            logger.info(
-                "[PegaKVConnector] Using kv_transfer_config.engine_id: %s",
-                instance_id,
-            )
+            logger.info("[PegaKVConnector] Using kv_transfer_config.engine_id: %s", instance_id)
         else:
-            # Fallback to instance_id or environment variable
-            instance_id = vllm_config.instance_id or os.environ.get(
-                "PEGAFLOW_INSTANCE_ID", ""
-            )
+            instance_id = vllm_config.instance_id or os.environ.get("PEGAFLOW_INSTANCE_ID", "")
             if not instance_id:
                 instance_id = uuid.uuid4().hex
-                logger.info(
-                    "[PegaKVConnector] No instance_id from vLLM; generated fallback %s",
-                    instance_id,
-                )
+                logger.info("[PegaKVConnector] No instance_id from vLLM; generated fallback %s", instance_id)
 
-            # If data parallelism is enabled, append local_dp_rank to ensure uniqueness
-            # This matches vLLM's behavior in core.py:_init_data_parallel()
+            # Append DP rank if data parallelism is enabled
             parallel_config = vllm_config.parallel_config
             if parallel_config.data_parallel_size > 1:
                 local_dp_rank = parallel_config.data_parallel_rank_local
@@ -160,74 +98,46 @@ class PegaKVConnector(KVConnectorBase_V1):
                     instance_id = f"{instance_id}_dp{local_dp_rank}"
                     logger.info(
                         "[PegaKVConnector] Appended DP rank to instance_id: %s (dp_size=%d, local_dp_rank=%d)",
-                        instance_id,
-                        parallel_config.data_parallel_size,
-                        local_dp_rank,
+                        instance_id, parallel_config.data_parallel_size, local_dp_rank,
                     )
 
         self._instance_id = instance_id
 
         # Extract TP info and model metadata
-        # Only WORKER role can get tp_rank via get_tensor_model_parallel_rank()
-        # because tensor parallel group is initialized in Worker.init_device(),
-        # which happens after Scheduler (and its connector) is created.
-        # SCHEDULER role doesn't need tp_rank - it only needs tp_size from config.
         self._tp_size = vllm_config.parallel_config.tensor_parallel_size
         self._num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
 
         self._tp_rank: Optional[int] = None
         self._device_id: Optional[int] = None
         if role == KVConnectorRole.WORKER:
-            # TP group is initialized by now for workers
             self._tp_rank = get_tensor_model_parallel_rank()
             if torch.cuda.is_available():
-                try:
-                    self._device_id = torch.cuda.current_device()
-                except Exception as exc:
-                    logger.warning(
-                        "[PegaKVConnector] Unable to detect CUDA device for worker: %s",
-                        exc,
-                    )
+                self._device_id = torch.cuda.current_device()
 
         logger.info(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d layers=%d",
-            role.name,
-            self._instance_id,
+            role.name, self._instance_id,
             self._device_id if self._device_id is not None else "cpu",
             self._tp_rank if self._tp_rank is not None else "N/A",
-            self._tp_size, self._num_layers
+            self._tp_size, self._num_layers,
         )
 
-        # ZMQ client for connecting to engine server (independent process)
+        # ZMQ client for connecting to engine server
         self._engine_endpoint = _ENGINE_ENDPOINT
         self._engine_context: Optional[zmq.Context] = None
         self._engine_socket = None
-        self._engine_lock = threading.Lock()  # Protect socket access
+        self._engine_lock = threading.Lock()
 
-        # Track block hashes for each request across steps
+        # State tracking
         self._request_block_hashes = {}  # req_id -> list[bytes]
-
-        # Track pending save operations
         self._pending_saves = []  # list[dict]
-
-        # Track requests that need to load KV cache from CPU
         self._requests_to_load = {}  # req_id -> dict with load info
-
-        # Track registered KV cache layers
         self._registered_layers: list[str] = []
 
-        # Get block size from vllm_config
+        # Block size and sync state
         self._block_size = vllm_config.cache_config.block_size
-        # NOTE: KV cache layout is detected in register_kv_caches() by checking tensor shape.
-        # vLLM uses KV-first layout: (2, num_blocks, block_size, num_heads, head_dim)
-        # where the first dimension (2) represents K and V separately.
-
-        # Shared-memory sync state for async layer loading (created in register_kv_caches)
         self._sync_state: Optional[PyLayerSyncState] = None
-        # Mapping from layer name to layer ID (for sync_state indexing)
         self._layer_name_to_id: Dict[str, int] = {}
-        # Flag to track if a load is currently in progress
-        # If False, wait_for_layer_load should return immediately
         self._load_in_progress: bool = False
 
     # ==============================
@@ -243,24 +153,13 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._engine_context = zmq.Context()
 
         self._engine_socket = self._engine_context.socket(zmq.REQ)
-        self._engine_socket.setsockopt(zmq.RCVTIMEO, 20000)  # 5 second timeout
+        self._engine_socket.setsockopt(zmq.RCVTIMEO, 20000)
         self._engine_socket.setsockopt(zmq.SNDTIMEO, 20000)
         self._engine_socket.connect(self._engine_endpoint)
         logger.info("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
 
     def _send_engine_request(self, command: str, payload: dict) -> dict:
-        """Send request to engine server and get response.
-
-        Args:
-            command: Command name (REGISTER, SAVE, LOAD, QUERY, etc.)
-            payload: Command payload dict
-
-        Returns:
-            Response dict with 'status' and optional result data
-
-        Raises:
-            RuntimeError: If request fails or times out
-        """
+        """Send request to engine server and get response."""
         payload = dict(payload)
         payload.setdefault("instance_id", self._instance_id)
         if self._tp_rank is not None:
@@ -269,42 +168,101 @@ class PegaKVConnector(KVConnectorBase_V1):
             payload.setdefault("device_id", self._device_id)
 
         with self._engine_lock:
-            try:
-                self._ensure_engine_socket()
+            self._ensure_engine_socket()
 
-                # Send request using multipart: [command, payload]
-                command_bytes = msgpack.packb(command)
-                payload_bytes = msgpack.packb(payload, use_bin_type=True)
-                self._engine_socket.send_multipart([command_bytes, payload_bytes])
+            command_bytes = msgpack.packb(command)
+            payload_bytes = msgpack.packb(payload, use_bin_type=True)
+            self._engine_socket.send_multipart([command_bytes, payload_bytes])
 
-                # Receive response using multipart
-                response_parts = self._engine_socket.recv_multipart()
-                if len(response_parts) != 1:
-                    raise RuntimeError(f"Invalid response format: expected 1 part, got {len(response_parts)}")
+            response_parts = self._engine_socket.recv_multipart()
+            assert len(response_parts) == 1, f"Invalid response format: expected 1 part, got {len(response_parts)}"
 
-                response = msgpack.unpackb(response_parts[0], raw=False)
+            response = msgpack.unpackb(response_parts[0], raw=False)
+            assert response.get('status') == 'success', f"Engine request failed: {response.get('message', 'Unknown error')}"
 
-                if response.get('status') != 'success':
-                    error_msg = response.get('message', 'Unknown error')
-                    raise RuntimeError(f"Engine request failed: {error_msg}")
-
-                return response
-
-            except zmq.error.Again:
-                raise RuntimeError(f"Engine request timeout: {command}")
-            except Exception as e:
-                # Try to reconnect on next request
-                if self._engine_socket is not None:
-                    try:
-                        self._engine_socket.close()
-                    except Exception:
-                        pass
-                    self._engine_socket = None
-                raise RuntimeError(f"Engine request error: {e}") from e
+            return response
 
     # ==============================
     # Worker-side methods
     # ==============================
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        """
+        Notifies worker-side connector ids of requests that have finished
+        generating tokens on the worker.
+        The scheduler process (via the Executors) will use this output
+        to track which workers are done.
+
+        Returns:
+            ids of requests that have finished asynchronous transfer
+            (requests that previously returned True from request_finished()),
+            tuple of (sending/saving ids, recving/loading ids).
+            The finished saves/sends req ids must belong to a set provided in a
+            call to this method (this call or a prior one).
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return None, None
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """
+        Get the set of block IDs that failed to load.
+
+        Returns:
+            Set of block IDs that encountered load errors.
+            Empty set if no load errors occurred.
+
+        Notes:
+            - Applies to both sync- and async-loading requests.
+            - Async loading: failed blocks may be reported in any forward pass
+              up to and including the pass where the request ID is returned by
+              `get_finished()`. Even if failures occur, the request must still
+              be reported via `get_finished()`, and the failed block IDs must
+              appear here no later than that same pass.
+            - Sync loading: failed blocks should be reported in the forward
+              pass in which they are detected.
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return set()
+
+    def get_kv_connector_stats(self) -> Optional["KVConnectorStats"]:
+        """
+        Get the KV connector stats collected during the last interval.
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return None
+
+    def get_handshake_metadata(self) -> "KVConnectorHandshakeMetadata" | None:
+        """
+        Get the KVConnector handshake metadata for this connector.
+        This metadata is used for out-of-band connector handshake
+        between P/D workers.
+
+        Returns:
+            KVConnectorHandshakeMetadata: the handshake metadata.
+            None if no handshake metadata is available.
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return None
+
+    # Base class provides implementation for these methods:
+    # - bind_connector_metadata(connector_metadata: KVConnectorMetadata)
+    # - clear_connector_metadata()
+    # We use the base class implementation directly.
+
+    def set_host_xfer_buffer_ops(self, copy_operation: "CopyBlocksOp"):
+        """
+        Set the xPU-specific ops for copying KV between host and device.
+        Needed when host buffer is used for kv transfer (e.g., in NixlConnector)
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return
 
     @timing_wrapper
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
@@ -320,98 +278,60 @@ class PegaKVConnector(KVConnectorBase_V1):
         Note:
             The number of elements in kv_caches and layer_names should be
             the same.
-
         """
-        # Reset load_in_progress flag at the start of each forward pass
-        # This ensures wait_for_layer_load returns immediately if no load is triggered
         self._load_in_progress = False
 
-        # ============================================================
-        # STEP 1: Get connector metadata
-        # ============================================================
         metadata = self._get_connector_metadata()
-
         if not isinstance(metadata, PegaConnectorMetadata):
             return
 
-        # ============================================================
-        # STEP 2: Check if there are requests to load
-        # ============================================================
         if not metadata.requests_to_load:
             return
 
         total_requests = len(metadata.requests_to_load)
+        load_start = time.perf_counter()
 
-        # ============================================================
-        # STEP 3: Load KV blocks for each request and each layer
-        # ============================================================
-        try:
-            load_start = time.perf_counter()
+        # Aggregate all blocks from all requests
+        all_block_ids: List[int] = []
+        all_block_hashes: List[bytes] = []
 
-            # Aggregate all blocks from all requests
-            all_block_ids: List[int] = []
-            all_block_hashes: List[bytes] = []
+        for req_id, load_info in metadata.requests_to_load.items():
+            all_block_ids.extend(load_info['block_ids'])
+            all_block_hashes.extend(load_info['block_hashes'])
 
-            for req_id, load_info in metadata.requests_to_load.items():
-                block_ids = load_info['block_ids']
-                block_hashes = load_info['block_hashes']
-                num_tokens = load_info['num_tokens']
+        if not all_block_ids:
+            return
 
-                all_block_ids.extend(block_ids)
-                all_block_hashes.extend(block_hashes)
+        # Identify all KV cache layers
+        target_layers: List[str] = []
+        for layer_name, layer in forward_context.no_compile_layers.items():
+            if hasattr(layer, 'kv_cache'):
+                target_layers.append(layer_name)
 
-            if not all_block_ids:
-                return
+        if not target_layers:
+            return
 
-            # Identify all KV cache layers in the order provided by vLLM
-            target_layers: List[str] = []
-            for layer_name, layer in forward_context.no_compile_layers.items():
-                if hasattr(layer, 'kv_cache'):
-                    target_layers.append(layer_name)
+        self._load_in_progress = True
 
-            if not target_layers:
-                return
+        response = self._send_engine_request('LOAD', {
+            'layer_names': target_layers,
+            'block_ids': all_block_ids,
+            'block_hashes': all_block_hashes,
+        })
 
-            # Mark load as in progress - server will reset and set sync_state flags
-            self._load_in_progress = True
+        num_layers_loaded = response.get('num_layers_loaded', 0)
+        total_bytes = response.get('total_bytes', 0)
+        total_blocks = len(all_block_ids) * num_layers_loaded
 
-            # Batch load for all layers with async transfers
-            response = self._send_engine_request('LOAD', {
-                'layer_names': target_layers,
-                'block_ids': all_block_ids,
-                'block_hashes': all_block_hashes
-            })
+        transfer_end = time.perf_counter()
+        total_time_us = (transfer_end - load_start) * 1e6
+        total_time_s = total_time_us / 1e6
+        bandwidth_gbps = (total_bytes / 1e9) / total_time_s if total_time_s > 0 else 0.0
 
-            num_layers_loaded = response.get('num_layers_loaded', 0)
-            total_bytes = response.get('total_bytes', 0)
-
-            total_blocks = len(all_block_ids) * num_layers_loaded
-            total_layers = num_layers_loaded
-
-            transfer_end = time.perf_counter()
-            total_time_us = (transfer_end - load_start) * 1e6
-            total_time_s = total_time_us / 1e6
-            bandwidth_gbps = (total_bytes / 1e9) / total_time_s if total_time_s > 0 else 0.0
-
-            logger.info(
-                "[PegaKVConnector] queued %d blocks (%.2f GB) across %d layers for %d reqs, "
-                "schedule %.0f us (%.2f GB/s)",
-                total_blocks,
-                total_bytes / 1e9,
-                num_layers_loaded,
-                total_requests,
-                total_time_us,
-                bandwidth_gbps,
-            )
-
-        except Exception as e:
-            # On error, reset the flag so wait_for_layer_load doesn't hang
-            self._load_in_progress = False
-            logger.debug(
-                "[PegaKVConnector] Error in start_load_kv: %s",
-                e,
-                exc_info=True,
-            )
+        logger.info(
+            "[PegaKVConnector] queued %d blocks (%.2f GB) across %d layers for %d reqs, schedule %.0f us (%.2f GB/s)",
+            total_blocks, total_bytes / 1e9, num_layers_loaded, total_requests, total_time_us, bandwidth_gbps,
+        )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
@@ -419,38 +339,26 @@ class PegaKVConnector(KVConnectorBase_V1):
         paged buffer. This is called from within attention layer to ensure
         async copying from start_load_kv is complete.
 
-        Uses shared-memory based spin-wait instead of ZMQ round-trips for
-        minimal latency.
+        This interface will be useful for layer-by-layer pipelining.
 
         Args:
             layer_name: the name of that layer
         """
-        # If no load is in progress, return immediately
-        # This handles the case when start_load_kv returned early (no requests to load)
         if not self._load_in_progress:
             return
 
-        # Use shared-memory sync state for fast local spin-wait
         if self._sync_state is not None and layer_name in self._layer_name_to_id:
             layer_id = self._layer_name_to_id[layer_name]
             self._sync_state.wait_layer(layer_id)
             return
 
-        # Fallback to ZMQ call if sync_state not initialized
-        try:
-            self._send_engine_request('WAIT_LAYER', {'layer_name': layer_name})
-        except Exception as exc:
-            logger.debug(
-                "[PegaKVConnector] wait_for_layer_load failed for %s: %s",
-                layer_name,
-                exc,
-                exc_info=True,
-            )
+        # Fallback to ZMQ call
+        self._send_engine_request('WAIT_LAYER', {'layer_name': layer_name})
 
     def save_kv_layer(
         self,
         layer_name: str,
-        kv_layer: "torch.Tensor",  # type: ignore[name-defined]
+        kv_layer: "torch.Tensor",
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
@@ -466,8 +374,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
-
-        # Store for later processing in wait_for_save
         self._pending_saves.append({
             'layer_name': layer_name,
             'attn_metadata': attn_metadata,
@@ -482,125 +388,125 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
-        import time
-
-        # ============================================================
-        # STEP 1: Check if there are pending saves
-        # ============================================================
-        if len(self._pending_saves) == 0:
+        if not self._pending_saves:
             return
 
-        try:
-            total_start = time.perf_counter()
+        total_start = time.perf_counter()
 
-            # ============================================================
-            # STEP 2: Get connector metadata
-            # ============================================================
-            metadata = self._get_connector_metadata()
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, PegaConnectorMetadata):
+            self._pending_saves.clear()
+            return
 
-            if not isinstance(metadata, PegaConnectorMetadata):
-                return
+        total_blocks_saved = 0
+        total_layers_saved = 0
 
-            # ============================================================
-            # STEP 3: Create CUDA event for synchronization
-            # ============================================================
-            with torch.cuda.stream(torch.cuda.current_stream()):
-                event = torch.cuda.Event(interprocess=True)
-                event.record()
+        for save_info in self._pending_saves:
+            layer_name = save_info['layer_name']
+            attn_metadata = save_info['attn_metadata']
 
-            # ============================================================
-            # STEP 4: Process each layer's save operation
-            # ============================================================
-            total_blocks_saved = 0
-            total_layers_saved = 0
+            if attn_metadata.block_table is None:
+                continue
 
-            for save_info in self._pending_saves:
-                layer_name = save_info['layer_name']
-                attn_metadata = save_info['attn_metadata']
+            block_table = attn_metadata.block_table
+            seq_lens = attn_metadata.seq_lens
+            layer_blocks_saved = 0
 
-                # Skip if block_table is missing or None
-                if attn_metadata.block_table is None:
+            for seq_idx in range(block_table.shape[0]):
+                if seq_lens is not None:
+                    seq_len = seq_lens[seq_idx].item()
+                    num_blocks = (seq_len + self._block_size - 1) // self._block_size
+                else:
+                    num_blocks = (block_table[seq_idx] != 0).sum().item()
+
+                if num_blocks == 0:
                     continue
 
-                block_table = attn_metadata.block_table  # [num_seqs, max_blocks]
-                seq_lens = attn_metadata.seq_lens
+                active_blocks = block_table[seq_idx, :num_blocks].cpu().tolist()
 
-                layer_blocks_saved = 0
+                # Find matching block hashes from metadata
+                block_hashes_for_seq = None
+                for req_id, hashes in metadata.block_hashes.items():
+                    if len(hashes) > 0:
+                        num_use = min(num_blocks, len(hashes))
+                        block_hashes_for_seq = hashes[:num_use]
+                        active_blocks = active_blocks[:num_use]
+                        break
 
-                # Process each sequence in the batch
-                for seq_idx in range(block_table.shape[0]):
-                    # Calculate number of blocks needed for this sequence
-                    if seq_lens is not None:
-                        seq_len = seq_lens[seq_idx].item()
-                        num_blocks = (seq_len + self._block_size - 1) // self._block_size
-                    else:
-                        # Fallback: count non-zero blocks
-                        num_blocks = (block_table[seq_idx] != 0).sum().item()
+                if block_hashes_for_seq is None:
+                    continue
 
-                    if num_blocks == 0:
-                        continue
+                self._send_engine_request('SAVE', {
+                    'layer_name': layer_name,
+                    'block_ids': active_blocks,
+                    'block_hashes': block_hashes_for_seq,
+                })
+                layer_blocks_saved += len(block_hashes_for_seq)
 
-                    # Get active block IDs for this sequence
-                    active_blocks = block_table[seq_idx, :num_blocks].cpu().tolist()
+            if layer_blocks_saved > 0:
+                total_blocks_saved += layer_blocks_saved
+                total_layers_saved += 1
 
-                    # Find matching block hashes from metadata
-                    # TODO: Improve mapping between seq_idx and req_id
-                    block_hashes_for_seq = None
-                    matched_req_id = None
-                    for req_id, hashes in metadata.block_hashes.items():
-                        if len(hashes) > 0:
-                            num_use = min(num_blocks, len(hashes))
-                            block_hashes_for_seq = hashes[:num_use]
-                            active_blocks = active_blocks[:num_use]
-                            matched_req_id = req_id
-                            break
+        total_end = time.perf_counter()
+        total_time_ms = (total_end - total_start) * 1000
 
-                    if block_hashes_for_seq is None:
-                        continue
+        if total_blocks_saved > 0:
+            logger.debug(
+                "[PegaKVConnector] saved %d blocks across %d layers (%.2f ms)",
+                total_blocks_saved, total_layers_saved, total_time_ms,
+            )
 
-                    # Save blocks to storage via Rust backend
-                    try:
-                        self._send_engine_request('SAVE', {
-                            'layer_name': layer_name,
-                            'block_ids': active_blocks,
-                            'block_hashes': block_hashes_for_seq
-                        })
-                        layer_blocks_saved += len(block_hashes_for_seq)
-                    except Exception:
-                        # Silently skip failed saves
-                        pass
-
-                if layer_blocks_saved > 0:
-                    total_blocks_saved += layer_blocks_saved
-                    total_layers_saved += 1
-
-            # ============================================================
-            # STEP 5: Wait for CUDA operations to complete
-            # ============================================================
-            event.synchronize()
-            total_end = time.perf_counter()
-            total_time_ms = (total_end - total_start) * 1000
-
-            if total_blocks_saved > 0:
-                logger.debug(
-                    "[PegaKVConnector] saved %d blocks across %d layers (%.2f ms)",
-                    total_blocks_saved,
-                    total_layers_saved,
-                    total_time_ms,
-                )
-
-        except Exception:
-            # Silently handle errors
-            pass
-        finally:
-            # ============================================================
-            # STEP 6: Clean up pending saves
-            # ============================================================
-            self._pending_saves.clear()
+        self._pending_saves.clear()
 
     # ==============================
     # Scheduler-side methods
     # ==============================
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput"):
+        """
+        Update KVConnector state from worker-side connectors output.
+
+        Args:
+            connector_output (KVConnectorOutput): the worker-side
+                connectors output.
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return
+
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """
+        Called exactly once when a request has finished, before its blocks are
+        freed.
+
+        The connector may assumes responsibility for freeing the blocks
+        asynchronously by returning True.
+
+        Returns:
+            True if the request is being saved/sent asynchronously and blocks
+            should not be freed until the request_id is returned from
+            get_finished().
+            Optional KVTransferParams to be included in the request outputs
+            returned by the engine.
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return False, None
+
+    def take_events(self) -> Iterable["KVCacheEvent"]:
+        """
+        Take the KV cache events from the connector.
+
+        Yields:
+            New KV cache events since the last call.
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return ()
 
     @timing_wrapper
     def get_num_new_matched_tokens(
@@ -648,12 +554,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         elapsed_us = (lookup_end - lookup_start) * 1e6
         logger.info(
             "[PegaKVConnector] scheduler_lookup req=%s hit_blocks=%d/%d (%.1f%%) cost=%.0f us",
-            req_id,
-            matched_blocks,
-            total_blocks,
+            req_id, matched_blocks, total_blocks,
             (matched_blocks / total_blocks * 100) if total_blocks > 0 else 0.0,
             elapsed_us,
         )
+
         if matched_blocks <= 0:
             return (0, False)
 
@@ -661,7 +566,6 @@ class PegaKVConnector(KVConnectorBase_V1):
         if available_tokens <= 1:
             return (0, False)
 
-        # Always leave at least one prompt token for the scheduler to compute
         reusable_tokens = available_tokens - 1
         num_new_tokens = reusable_tokens - num_computed_tokens
 
@@ -693,11 +597,8 @@ class PegaKVConnector(KVConnectorBase_V1):
                 loaded from the external KV cache.
         """
         req_id = request.request_id
-
-        # block hashes is  a list[bytes]
         self._request_block_hashes[req_id] = request.block_hashes
 
-        # If there are external tokens to load, record this request
         if num_external_tokens > 0:
             self._requests_to_load[req_id] = {
                 'request': request,
@@ -718,121 +619,81 @@ class PegaKVConnector(KVConnectorBase_V1):
         """
         block_hashes = {}
 
-        # ============================================================
-        # STEP 1: Process new requests (first time scheduled)
-        # ============================================================
-        new_reqs = scheduler_output.scheduled_new_reqs
-        for req in new_reqs:
+        # Process new requests
+        for req in scheduler_output.scheduled_new_reqs:
             req_id = req.req_id
-
-            # Use block hashes saved from update_state_after_alloc()
-            # These are vLLM's content-based hashes computed from token sequences
             if req_id in self._request_block_hashes:
-                saved_hashes = self._request_block_hashes[req_id]
-                block_hashes[req_id] = saved_hashes
+                block_hashes[req_id] = self._request_block_hashes[req_id]
 
-        # ============================================================
-        # STEP 2: Process cached requests (already scheduled, now in decode phase)
-        # ============================================================
-        # Note: For cached requests, block_hashes are already updated in
-        # update_state_after_alloc() when new blocks are allocated during decode.
-        # We just need to retrieve them from our persistent state.
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        for i, req_id in enumerate(cached_reqs.req_ids):
-            # Use block hashes from persistent state (updated by update_state_after_alloc)
+        # Process cached requests
+        for i, req_id in enumerate(scheduler_output.scheduled_cached_reqs.req_ids):
             if req_id in self._request_block_hashes:
-                saved_hashes = self._request_block_hashes[req_id]
-                block_hashes[req_id] = saved_hashes
+                block_hashes[req_id] = self._request_block_hashes[req_id]
 
-        # ============================================================
-        # STEP 3: Process requests that need to load from CPU storage
-        # ============================================================
+        # Process requests that need to load from CPU storage
         requests_to_load = {}
-
         for req_id, load_info in self._requests_to_load.items():
             num_external_tokens = load_info['num_external_tokens']
 
-            # Find this request in scheduler_output
-            found = False
             for req in scheduler_output.scheduled_new_reqs:
                 if req.req_id == req_id:
-                    # Extract block IDs from the request
                     block_ids = list(req.block_ids[0]) if req.block_ids else []
-
-                    # Calculate number of blocks needed, clamp to available hashes
                     num_blocks = (num_external_tokens + self._block_size - 1) // self._block_size
                     saved_hashes = self._request_block_hashes.get(req_id, [])
                     num_blocks = min(num_blocks, len(saved_hashes))
 
                     if num_blocks > 0 and len(block_ids) >= num_blocks:
-                        load_hashes = saved_hashes[:num_blocks]
-
-                        # Store load information
                         requests_to_load[req_id] = {
                             'block_ids': block_ids[:num_blocks],
-                            'block_hashes': load_hashes,
+                            'block_hashes': saved_hashes[:num_blocks],
                             'num_tokens': num_external_tokens,
                         }
-
-                    found = True
                     break
 
-        # Clear the requests_to_load after processing
         self._requests_to_load.clear()
 
-        # ============================================================
-        # STEP 4: Build and return metadata
-        # ============================================================
-        metadata = PegaConnectorMetadata(
+        return PegaConnectorMetadata(
             block_hashes=block_hashes,
             requests_to_load=requests_to_load,
         )
 
-        return metadata
-
     def _count_available_block_prefix(self, block_hashes: List[bytes]) -> int:
-        """Return length of contiguous prefix available in CPU storage."""
+        """
+        Return length of contiguous prefix available in CPU storage.
+
+        Note: This is a PegaFlow-specific helper method.
+        """
         if not block_hashes:
             return 0
 
-        try:
-            response = self._send_engine_request('QUERY', {
-                'block_hashes': block_hashes
-            })
-            return response.get('hit_blocks', 0)
-        except Exception:
-            return 0
+        response = self._send_engine_request('QUERY', {'block_hashes': block_hashes})
+        return response.get('hit_blocks', 0)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        """Register the active inference context with the engine service.
+        """
+        Initialize with the KV caches. Useful for pre-registering the
+        KV Caches in the KVConnector (e.g. for NIXL).
 
         Args:
-            kv_caches: Dictionary mapping layer names to KV cache tensors
+            kv_caches: dictionary of layer names, kv cache
         """
-        if self._device_id is None:
-            raise RuntimeError(
-                "CUDA device id is unknown; cannot register KV caches without a bound device"
-            )
+        assert self._device_id is not None, "CUDA device id is unknown; cannot register KV caches"
 
         self._registered_layers = list(kv_caches.keys())
 
         # Create shared-memory sync state for async layer loading
-        # This is used by wait_for_layer_load to spin-wait locally instead of ZMQ calls
         self._sync_state = PyLayerSyncState(self._num_layers)
         shm_name = self._sync_state.shm_name()
 
-        # Build layer_name -> layer_id mapping (ordered by registration)
+        # Build layer_name -> layer_id mapping
         self._layer_name_to_id.clear()
         for layer_id, layer_name in enumerate(kv_caches.keys()):
             self._layer_name_to_id[layer_name] = layer_id
 
+        layout = "unknown"
         for layer_name, kv_cache in kv_caches.items():
-            if kv_cache.storage_offset() != 0:
-                raise RuntimeError(
-                    f"KV cache for {layer_name} must have zero storage offset"
-                )
+            assert kv_cache.storage_offset() == 0, f"KV cache for {layer_name} must have zero storage offset"
 
-            # Create CUDA IPC wrapper for cross-process sharing
             wrapper = CudaIPCWrapper(kv_cache)
             wrapper_bytes = pickle.dumps(wrapper)
 
@@ -840,14 +701,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             stride = tuple(kv_cache.stride())
             element_size = kv_cache.element_size()
 
-            # Detect KV cache layout:
-            # - KV-first layout: shape = (2, num_blocks, block_size, num_heads, head_dim)
-            #   where shape[0] = 2 for K and V
-            # - Blocks-first layout: shape = (num_blocks, block_size, num_heads, head_dim)
-            #   where shape[0] = num_blocks
-            #
-            # We detect this by checking if shape[0] == 2, which indicates KV-first layout.
-            # In KV-first layout, the actual num_blocks is shape[1].
+            # Detect KV cache layout
             if len(shape) >= 2 and shape[0] == 2:
                 # KV-first layout: (2, num_blocks, ...)
                 num_blocks = shape[1]
@@ -863,78 +717,129 @@ class PegaKVConnector(KVConnectorBase_V1):
                 segments = 1
                 layout = "blocks-first"
 
-            if bytes_per_block == 0:
-                raise RuntimeError(
-                    f"Invalid bytes_per_block for {layer_name}: stride={stride}"
-                )
+            assert bytes_per_block != 0, f"Invalid bytes_per_block for {layer_name}: stride={stride}"
 
-            # Send to engine server for registration
-            # Include shm_name so server can attach to the shared memory sync state
-            try:
-                payload = {
-                    'layer_name': layer_name,
-                    'wrapper_bytes': wrapper_bytes,
-                    'num_blocks': num_blocks,
-                    'bytes_per_block': bytes_per_block,
-                    'kv_stride_bytes': kv_stride_bytes,
-                    'segments': segments,
-                    'tp_size': self._tp_size,
-                    'num_layers': self._num_layers,
-                    'shm_name': shm_name,
-                }
-                payload['device_id'] = self._device_id
-                self._send_engine_request('REGISTER_CONTEXT', payload)
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to register layer {layer_name} with engine: {e}"
-                ) from e
+            self._send_engine_request('REGISTER_CONTEXT', {
+                'layer_name': layer_name,
+                'wrapper_bytes': wrapper_bytes,
+                'num_blocks': num_blocks,
+                'bytes_per_block': bytes_per_block,
+                'kv_stride_bytes': kv_stride_bytes,
+                'segments': segments,
+                'tp_size': self._tp_size,
+                'num_layers': self._num_layers,
+                'shm_name': shm_name,
+                'device_id': self._device_id,
+            })
 
         logger.info(
             "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s shm=%s",
-            len(kv_caches),
-            layout if kv_caches else "unknown",
-            self._instance_id,
-            shm_name,
+            len(kv_caches), layout, self._instance_id, shm_name,
         )
 
     def unregister_context(self) -> None:
-        """Unregister the active inference context from the engine server."""
+        """
+        Unregister the active inference context from the engine server.
+
+        Note: This is a PegaFlow-specific method not in the base class.
+        """
         if not self._registered_layers:
             return
 
-        try:
-            # Only tp_rank=0 should unregister the instance to avoid duplicate calls.
-            # All TP ranks share the same instance_id, so only one needs to do cleanup.
-            if self._tp_rank == 0:
-                self._send_engine_request('UNREGISTER_CONTEXT', {})
-        except Exception as exc:
-            logger.debug(
-                "[PegaKVConnector] Failed to unregister context: %s",
-                exc,
-                exc_info=True,
-            )
-        finally:
-            self._registered_layers.clear()
+        if self._tp_rank == 0:
+            self._send_engine_request('UNREGISTER_CONTEXT', {})
+
+        self._registered_layers.clear()
+
+    # ==============================
+    # Additional base class methods NOT IMPLEMENTED in PegaFlow
+    # ==============================
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
+        """
+        Get the required KV cache layout for this connector.
+        Args:
+            vllm_config (VllmConfig): the vllm config.
+
+        Returns:
+            str: the required KV cache layout. e.g. HND, or NHD.
+            None if the connector does not require a specific layout.
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return None
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> Optional["KVConnectorStats"]:
+        """
+        KVConnectorStats resolution method. This method allows dynamically
+        registered connectors to return their own KVConnectorStats object,
+        which can implement custom aggregation logic on the data dict.
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return None
+
+    def set_xfer_handshake_metadata(
+        self, metadata: dict[int, "KVConnectorHandshakeMetadata"]
+    ) -> None:
+        """
+        Set the KV connector handshake metadata for this connector.
+
+        Args:
+            metadata (KVConnectorHandshakeMetadata): the handshake metadata to set.
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return None
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: "VllmConfig",
+        metric_types: dict[type["PromMetric"], type["PromMetricT"]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[str]],
+    ) -> Optional["KVConnectorPromMetrics"]:
+        """
+        Create a KVConnectorPromMetrics subclass which should register
+        per-connector Prometheus metrics and implement observe() to
+        expose connector transfer stats via Prometheus.
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return None
+
+    def get_finished_count(self) -> int | None:
+        """
+        Get the count of requests expected to complete send/receive operations
+        via this connector. This method is used to initialize the
+        KVOutputAggregator, overwriting the default world_size.
+
+        Returns:
+            int: expected sending or receiving completion count.
+
+        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
+        """
+        return None
 
     def shutdown(self):
-        """Shutdown the connector and unregister all KV caches."""
+        """
+        Shutdown the connector. This is called when the worker process
+        is shutting down to ensure that all the async operations are
+        completed and the connector is cleaned up properly.
+        """
         self.unregister_context()
 
-        # Shutdown engine connection
         if self._engine_socket is not None:
-            try:
-                # Send shutdown command to engine (optional - engine can stay running)
-                # self._send_engine_request('SHUTDOWN', {})
-                self._engine_socket.close(0)
-            except Exception:
-                pass
+            self._engine_socket.close(0)
             self._engine_socket = None
 
         if self._engine_context is not None:
-            try:
-                self._engine_context.term()
-            except Exception:
-                pass
+            self._engine_context.term()
             self._engine_context = None
 
 
