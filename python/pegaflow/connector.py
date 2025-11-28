@@ -12,8 +12,10 @@ import queue
 import threading
 import time
 import uuid
+import enum
 from collections.abc import Iterable
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import msgpack
 import torch
@@ -30,22 +32,421 @@ from pegaflow.ipc_wrapper import CudaIPCWrapper
 from pegaflow.logging_utils import get_connector_logger, timing_wrapper
 from pegaflow.pegaflow import PyLayerSyncState
 
+if TYPE_CHECKING:
+    from vllm.attention.backends.abstract import AttentionMetadata
+    from vllm.config import VllmConfig
+    from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorHandshakeMetadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+        KVConnectorPromMetrics,
+        KVConnectorStats,
+        PromMetric,
+        PromMetricT,
+    )
+    from vllm.forward_context import ForwardContext
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.outputs import KVConnectorOutput
+    from vllm.v1.request import Request
+
+    # Type alias for copy operation (defined in vllm internals)
+    CopyBlocksOp = Any
+
 logger = get_connector_logger()
 
 # Engine server endpoint (independent process)
 _ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT", "ipc:///tmp/pega_engine.sock")
 
-ReqId = str
 
-class PegaConnectorMetadata(KVConnectorMetadata):
+# ==============================================================================
+# Request Tracking: Phase, Intents, and Tracker
+# ==============================================================================
+
+
+class RequestPhase(enum.Enum):
+    """
+    Represents the lifecycle phase of a request in the KV connector.
+
+    Phase transitions:
+        LOOKUP -> LOADING -> ACTIVE -> DRAINING -> DONE
+                    |          ^
+                    +----------+  (if no external KV needed)
+    """
+    LOOKUP = "lookup"       # Waiting for lookup result from external storage
+    LOADING = "loading"     # Need to load KV from external storage
+    ACTIVE = "active"       # Actively generating (may be saving concurrently)
+    DRAINING = "draining"   # Generation done, waiting for async save to complete
+    DONE = "done"           # Fully completed
+
+
+@dataclass(frozen=True)
+class LoadIntent:
+    """
+    Immutable intent for a KV load operation.
+
+    Produced by RequestTracker.consume_load_intent() and consumed by worker
+    to load KV cache from external storage into GPU memory.
+    """
+    block_ids: tuple[int, ...]
+    block_hashes: tuple[bytes, ...]
+    num_tokens: int
+
+
+@dataclass(frozen=True)
+class SaveIntent:
+    """
+    Immutable intent for a KV save operation.
+
+    Produced by RequestTracker.consume_save_intent() and consumed by worker
+    to save KV cache from GPU memory to external storage.
+    """
+    block_ids: tuple[int, ...]
+    block_hashes: tuple[bytes, ...]
+
+
+class RequestTracker:
+    """
+    Tracks the KV cache state for a single request.
+
+    Design principles:
+    - Event-driven: External code notifies state changes via on_xxx() methods
+    - Intent pattern: Use consume_xxx_intent() to get operations to perform
+    - Single consumption: Load intent can only be consumed once
+    - Phase is derived: No manual state machine, phase is computed from internal state
+
+    Usage:
+        tracker = RequestTracker(req_id, block_hashes, block_size, num_layers)
+
+        # On lookup result
+        tracker.on_lookup(hit_blocks=10, computed_blocks=5)
+
+        # On block allocation
+        tracker.on_alloc(block_ids=[1,2,3], num_external_tokens=320)
+
+        # When scheduled
+        tracker.on_scheduled(num_tokens=128)
+
+        # Get load intent (consumed once)
+        if load := tracker.consume_load_intent():
+            # Execute load operation
+
+        # Get save intent (can be called multiple times)
+        if save := tracker.consume_save_intent():
+            # Execute save operation
+    """
+
+    __slots__ = (
+        'request_id', '_block_hashes', '_block_size',
+        # Lookup state
+        '_hit_blocks', '_computed_blocks', '_lookup_done',
+        # Allocation state
+        '_allocated_blocks', '_external_tokens',
+        # Progress tracking
+        '_scheduled_tokens', '_stored_blocks',
+        # Save tracking
+        '_total_layers', '_saved_layers',
+        # Flags
+        '_load_consumed', '_finished',
+    )
+
     def __init__(
         self,
-        block_hashes: Optional[Dict[str, List[bytes]]] = None,
-        requests_to_load: Optional[Dict[str, Dict]] = None,
+        request_id: str,
+        block_hashes: list[bytes],
+        block_size: int,
+        num_layers: int,
+    ):
+        """
+        Initialize a new request tracker.
+
+        Args:
+            request_id: Unique identifier for the request
+            block_hashes: List of block hashes for this request
+            block_size: Number of tokens per block
+            num_layers: Total number of KV cache layers
+        """
+        self.request_id = request_id
+        self._block_hashes = tuple(block_hashes)
+        self._block_size = block_size
+
+        # Lookup state
+        self._hit_blocks: int = 0
+        self._computed_blocks: int = 0
+        self._lookup_done: bool = False
+
+        # Allocation state
+        self._allocated_blocks: list[int] = []
+        self._external_tokens: int = 0
+
+        # Progress tracking
+        self._scheduled_tokens: int = 0
+        self._stored_blocks: int = 0
+
+        # Save tracking
+        self._total_layers = num_layers
+        self._saved_layers: int = 0
+
+        # Flags
+        self._load_consumed: bool = False
+        self._finished: bool = False
+
+    # ========== Properties ==========
+
+    @property
+    def phase(self) -> RequestPhase:
+        """
+        Current lifecycle phase (read-only, derived from internal state).
+
+        Returns:
+            RequestPhase indicating current state
+        """
+        if not self._lookup_done:
+            return RequestPhase.LOOKUP
+        if self._needs_load and not self._load_consumed:
+            return RequestPhase.LOADING
+        if not self._finished:
+            return RequestPhase.ACTIVE
+        if self._saved_layers < self._total_layers:
+            return RequestPhase.DRAINING
+        return RequestPhase.DONE
+
+    @property
+    def _needs_load(self) -> bool:
+        """Check if this request needs to load KV from external storage."""
+        return self._external_tokens > 0 and self._hit_blocks > self._computed_blocks
+
+    @property
+    def block_hashes(self) -> tuple[bytes, ...]:
+        """Get the block hashes for this request."""
+        return self._block_hashes
+
+    # ========== Event Methods ==========
+
+    def on_lookup(self, hit_blocks: int, computed_blocks: int) -> None:
+        """
+        Handle lookup result from external storage.
+
+        Args:
+            hit_blocks: Number of blocks available in external storage
+            computed_blocks: Number of blocks already computed locally (vLLM hit)
+
+        Raises:
+            AssertionError: If lookup was already done
+        """
+        assert not self._lookup_done, f"lookup already done for {self.request_id}"
+        old_phase = self.phase
+        self._hit_blocks = hit_blocks
+        self._computed_blocks = computed_blocks
+        self._lookup_done = True
+        logger.info(
+            "[RequestTracker] %s on_lookup: hit=%d computed=%d phase=%s->%s",
+            self.request_id, hit_blocks, computed_blocks, old_phase.value, self.phase.value,
+        )
+
+    def on_alloc(self, block_ids: list[int], num_external_tokens: int) -> None:
+        """
+        Handle block allocation event.
+
+        Args:
+            block_ids: List of newly allocated block IDs
+            num_external_tokens: Number of tokens to load from external storage
+        """
+        old_phase = self.phase
+        self._allocated_blocks.extend(block_ids)
+        if num_external_tokens > 0:
+            self._external_tokens = num_external_tokens
+        if block_ids:
+            logger.info(
+                "[RequestTracker] %s on_alloc: +%d blocks (total=%d) external_tokens=%d phase=%s->%s",
+                self.request_id, len(block_ids), len(self._allocated_blocks),
+                self._external_tokens, old_phase.value, self.phase.value,
+            )
+
+    def on_scheduled(self, num_tokens: int) -> None:
+        """
+        Handle scheduling event.
+
+        Args:
+            num_tokens: Number of tokens scheduled for this step
+        """
+        self._scheduled_tokens += num_tokens
+        logger.debug(
+            "[RequestTracker] %s on_scheduled: +%d tokens (total=%d)",
+            self.request_id, num_tokens, self._scheduled_tokens,
+        )
+
+    def on_layer_saved(self) -> None:
+        """
+        Handle layer save completion event.
+
+        Called when one layer of KV cache has been saved to external storage.
+        """
+        old_phase = self.phase
+        self._saved_layers += 1
+        assert self._saved_layers <= self._total_layers, \
+            f"saved {self._saved_layers} > total {self._total_layers} for {self.request_id}"
+        logger.debug(
+            "[RequestTracker] %s on_layer_saved: %d/%d phase=%s->%s",
+            self.request_id, self._saved_layers, self._total_layers,
+            old_phase.value, self.phase.value,
+        )
+
+    def on_finished(self) -> None:
+        """
+        Handle request generation completion event.
+
+        Called when the request has finished generating all tokens.
+        """
+        old_phase = self.phase
+        self._finished = True
+        logger.info(
+            "[RequestTracker] %s on_finished: phase=%s->%s",
+            self.request_id, old_phase.value, self.phase.value,
+        )
+
+    # ========== Intent Methods (Single Consumption) ==========
+
+    def consume_load_intent(self) -> LoadIntent | None:
+        """
+        Get the load operation intent.
+
+        This method can only return a non-None value once. Subsequent calls
+        will return None after the intent has been consumed.
+
+        Returns:
+            LoadIntent if load is needed and not yet consumed, None otherwise
+        """
+        if self._load_consumed or not self._needs_load:
+            return None
+
+        num_blocks = min(
+            self._hit_blocks,
+            len(self._allocated_blocks),
+            len(self._block_hashes),
+        )
+        load_blocks = num_blocks - self._computed_blocks
+
+        if load_blocks <= 0:
+            return None
+
+        # Mark as consumed
+        old_phase = self.phase
+        self._load_consumed = True
+
+        # Load from computed_blocks to hit_blocks
+        start = self._computed_blocks
+        end = start + load_blocks
+
+        intent = LoadIntent(
+            block_ids=tuple(self._allocated_blocks[start:end]),
+            block_hashes=self._block_hashes[start:end],
+            num_tokens=load_blocks * self._block_size,
+        )
+        logger.info(
+            "[RequestTracker] %s consume_load_intent: %d blocks [%d:%d] phase=%s->%s",
+            self.request_id, load_blocks, start, end, old_phase.value, self.phase.value,
+        )
+        return intent
+
+    def consume_save_intent(self) -> SaveIntent | None:
+        """
+        Get the save operation intent.
+
+        This method can be called multiple times. Each call returns newly
+        available blocks that haven't been saved yet.
+
+        Returns:
+            SaveIntent if there are new blocks to save, None otherwise
+        """
+        # Calculate saveable blocks based on scheduled tokens
+        saveable = min(
+            len(self._block_hashes),
+            len(self._allocated_blocks),
+            self._scheduled_tokens // self._block_size,
+        )
+
+        new_blocks = saveable - self._stored_blocks
+        if new_blocks <= 0:
+            return None
+
+        start = self._stored_blocks
+        end = start + new_blocks
+
+        # Update stored count
+        self._stored_blocks = end
+
+        intent = SaveIntent(
+            block_ids=tuple(self._allocated_blocks[start:end]),
+            block_hashes=self._block_hashes[start:end],
+        )
+        logger.info(
+            "[RequestTracker] %s consume_save_intent: %d blocks [%d:%d] total_stored=%d",
+            self.request_id, new_blocks, start, end, self._stored_blocks,
+        )
+        return intent
+
+    # ========== Query Methods ==========
+
+    def should_hold_blocks(self) -> bool:
+        """
+        Check if blocks should be held (not freed) for async save.
+
+        Returns:
+            True if request is finished but save is still in progress
+        """
+        return self._finished and self._saved_layers < self._total_layers
+
+    def is_done(self) -> bool:
+        """
+        Check if request is fully completed.
+
+        Returns:
+            True if both generation and saving are complete
+        """
+        return self.phase == RequestPhase.DONE
+
+    def is_saving(self) -> bool:
+        """
+        Check if request has started saving.
+
+        Returns:
+            True if at least one save intent has been consumed
+        """
+        return self._stored_blocks > 0
+
+    def __repr__(self) -> str:
+        return (
+            f"RequestTracker(id={self.request_id}, phase={self.phase.value}, "
+            f"hit={self._hit_blocks}, computed={self._computed_blocks}, "
+            f"allocated={len(self._allocated_blocks)}, stored={self._stored_blocks}, "
+            f"saved_layers={self._saved_layers}/{self._total_layers})"
+        )
+
+
+class PegaConnectorMetadata(KVConnectorMetadata):
+    """
+    Metadata passed from scheduler to worker for KV cache operations.
+
+    Contains lists of load and save intents that the worker should execute.
+    """
+
+    def __init__(
+        self,
+        load_intents: Optional[Dict[str, LoadIntent]] = None,
+        save_intents: Optional[Dict[str, SaveIntent]] = None,
     ):
         super().__init__()
-        self.block_hashes = block_hashes or {}
-        self.requests_to_load = requests_to_load or {}
+        # Maps request_id -> intent
+        self.load_intents: Dict[str, LoadIntent] = load_intents or {}
+        self.save_intents: Dict[str, SaveIntent] = save_intents or {}
+
+    def __repr__(self) -> str:
+        return (
+            f"PegaConnectorMetadata(loads={len(self.load_intents)}, "
+            f"saves={len(self.save_intents)})"
+        )
 
 
 class PegaKVConnector(KVConnectorBase_V1):
@@ -131,23 +532,19 @@ class PegaKVConnector(KVConnectorBase_V1):
         )
         self._save_thread.start()
 
-        self._request_block_hashes = {}  # req_id -> list[bytes]
-        self._requests_to_load = {}  # req_id -> dict with load info
+        # Request tracking (Scheduler side)
+        self._trackers: Dict[str, RequestTracker] = {}
         self._registered_layers: list[str] = []
 
         # Block size and sync state
         self._block_size = vllm_config.cache_config.block_size
         self._sync_state: Optional[PyLayerSyncState] = None
         self._layer_name_to_id: Dict[str, int] = {}
-        self._load_in_progress: bool = False
 
         # Async save completion tracking (Worker side)
         self._req_pending_layers: Dict[str, int] = {}  # req_id -> remaining layer count
         self._completed_saves: set[str] = set()  # req_ids with all layers saved
         self._save_completion_lock = threading.Lock()
-
-        # Scheduler side: track requests being saved
-        self._requests_being_saved: set[str] = set()  # req_ids currently being saved
 
     # ==============================
     # Engine client helper methods
@@ -229,7 +626,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         """Process a single save task in the worker thread."""
         layer_name = task['layer_name']
         attn_metadata = task['attn_metadata']
-        metadata = task['metadata']
+        metadata: PegaConnectorMetadata = task['metadata']
         request_ids = task.get('request_ids', [])
 
         if attn_metadata.block_table is None:
@@ -238,11 +635,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             return
 
         try:
-            # Execute save logic
-            block_table = attn_metadata.block_table
-            seq_lens = attn_metadata.seq_lens
-            layer_blocks_saved = 0
-
             # Common payload fields
             payload_base = {
                 "instance_id": self._instance_id,
@@ -252,38 +644,19 @@ class PegaKVConnector(KVConnectorBase_V1):
                 payload_base["tp_rank"] = self._tp_rank
             if self._device_id is not None:
                 payload_base["device_id"] = self._device_id
-            for seq_idx in range(block_table.shape[0]):
-                if seq_lens is not None:
-                    seq_len = seq_lens[seq_idx].item()
-                    num_blocks = (seq_len + self._block_size - 1) // self._block_size
-                else:
-                    num_blocks = (block_table[seq_idx] != 0).sum().item()
 
-                if num_blocks == 0:
+            # Process each save intent
+            for _, save_intent in metadata.save_intents.items():
+                if not save_intent.block_ids:
                     continue
 
-                active_blocks = block_table[seq_idx, :num_blocks].cpu().tolist()
-
-                # Find matching block hashes from metadata
-                block_hashes_for_seq = None
-                for req_id, hashes in metadata.block_hashes.items():
-                    if len(hashes) > 0:
-                        num_use = min(num_blocks, len(hashes))
-                        block_hashes_for_seq = hashes[:num_use]
-                        active_blocks = active_blocks[:num_use]
-                        break
-
-                if block_hashes_for_seq is None:
-                    continue
-
-                # Send SAVE request
+                # Send SAVE request using intent data directly
                 payload = payload_base.copy()
                 payload.update({
-                    'block_ids': active_blocks,
-                    'block_hashes': block_hashes_for_seq,
+                    'block_ids': list(save_intent.block_ids),
+                    'block_hashes': list(save_intent.block_hashes),
                 })
                 self._zmq_send_recv(socket, 'SAVE', payload)
-                layer_blocks_saved += len(block_hashes_for_seq)
 
         except Exception as e:
             logger.error(f"[PegaKVConnector] Save failed for layer {layer_name}: {e}", exc_info=True)
@@ -414,27 +787,25 @@ class PegaKVConnector(KVConnectorBase_V1):
             The number of elements in kv_caches and layer_names should be
             the same.
         """
-        self._load_in_progress = False
-
         metadata = self._get_connector_metadata()
-
-        if not metadata.requests_to_load:
-            logger.info("not metadata to load")
+        if not isinstance(metadata, PegaConnectorMetadata):
             return
 
-        total_requests = len(metadata.requests_to_load)
+        if not metadata.load_intents:
+            return
+
+        total_requests = len(metadata.load_intents)
         load_start = time.perf_counter()
 
-        # Aggregate all blocks from all requests
+        # Aggregate all blocks from all load intents
         all_block_ids: List[int] = []
         all_block_hashes: List[bytes] = []
 
-        for req_id, load_info in metadata.requests_to_load.items():
-            all_block_ids.extend(load_info['block_ids'])
-            all_block_hashes.extend(load_info['block_hashes'])
+        for _, load_intent in metadata.load_intents.items():
+            all_block_ids.extend(load_intent.block_ids)
+            all_block_hashes.extend(load_intent.block_hashes)
 
         if not all_block_ids:
-            logger.info("not block")
             return
 
         # Identify all KV cache layers
@@ -444,10 +815,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                 target_layers.append(layer_name)
 
         if not target_layers:
-            logger.info("not layers")
             return
-
-        self._load_in_progress = True
 
         response = self._send_engine_request('LOAD', {
             'layer_names': target_layers,
@@ -480,7 +848,9 @@ class PegaKVConnector(KVConnectorBase_V1):
         Args:
             layer_name: the name of that layer
         """
-        if not self._load_in_progress:
+        # Check if there are any load intents in current metadata
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, PegaConnectorMetadata) or not metadata.load_intents:
             return
 
         if self._sync_state is not None and layer_name in self._layer_name_to_id:
@@ -513,8 +883,8 @@ class PegaKVConnector(KVConnectorBase_V1):
         if not isinstance(metadata, PegaConnectorMetadata):
             return
 
-        # Extract request IDs from metadata
-        request_ids = list(metadata.block_hashes.keys())
+        # Extract request IDs from save intents
+        request_ids = list(metadata.save_intents.keys())
         if not request_ids:
             return
 
@@ -558,10 +928,19 @@ class PegaKVConnector(KVConnectorBase_V1):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
-        # Process finished sends - remove from being_saved set
+        # Process finished sends - notify trackers and clean up
         for req_id in connector_output.finished_sending or []:
-            self._requests_being_saved.discard(req_id)
-            logger.info(f"[PegaKVConnector] Request {req_id} save completed, blocks can be freed")
+            tracker = self._trackers.get(req_id)
+            if tracker:
+                # Mark all layers as saved (worker confirmed completion)
+                while tracker._saved_layers < tracker._total_layers:
+                    tracker.on_layer_saved()
+                logger.info(f"[PegaKVConnector] Request {req_id} save completed, phase={tracker.phase.value}")
+
+                # Clean up tracker if fully done
+                if tracker.is_done():
+                    del self._trackers[req_id]
+                    logger.debug(f"[PegaKVConnector] Cleaned up tracker for {req_id}")
 
     def request_finished(
         self,
@@ -583,11 +962,16 @@ class PegaKVConnector(KVConnectorBase_V1):
             returned by the engine.
         """
         req_id = request.request_id
+        tracker = self._trackers.get(req_id)
 
-        # If this request is being saved, delay block freeing
-        if req_id in self._requests_being_saved:
-            logger.info(f"[PegaKVConnector] Request {req_id} blocks held for async save")
-            return (True, None)
+        if tracker:
+            # Notify tracker that generation is finished
+            tracker.on_finished()
+
+            # Check if we need to hold blocks for async save
+            if tracker.should_hold_blocks():
+                logger.info(f"[PegaKVConnector] Request {req_id} blocks held for async save")
+                return (True, None)
 
         return (False, None)
 
@@ -639,23 +1023,33 @@ class PegaKVConnector(KVConnectorBase_V1):
         num_tokens = request.num_tokens
         block_hashes = request.block_hashes
 
-        lookup_start = time.perf_counter()
-        matched_blocks = self._count_available_block_prefix(block_hashes)
-        lookup_end = time.perf_counter()
+        # Get or create tracker for this request
+        tracker = self._get_or_create_tracker(request)
 
+        lookup_start = time.perf_counter()
+        hit_blocks = self._count_available_block_prefix(block_hashes)
+        lookup_end = time.perf_counter()
         elapsed_us = (lookup_end - lookup_start) * 1e6
 
-        num_hit_tokens = matched_blocks * self._block_size - num_computed_tokens
+        computed_blocks = num_computed_tokens // self._block_size
+
+        # Notify tracker of lookup result
+        tracker.on_lookup(hit_blocks, computed_blocks)
+
+        # Calculate tokens to load
+        num_hit_tokens = hit_blocks * self._block_size - num_computed_tokens
 
         if num_hit_tokens <= 0:
             return (0, False)
 
-        if num_hit_tokens == num_tokens:
-            num_hit_tokens -= 1
+        # Avoid loading all tokens (need at least 1 token to compute)
+        if num_hit_tokens >= num_tokens:
+            num_hit_tokens = num_tokens - 1
 
         logger.info(
-            "[PegaKVConnector] scheduler_lookup req=%s hit_tokens=%d, num_computed_tokens=%d, elapsed_us=%d",
-            req_id, num_hit_tokens, num_computed_tokens, elapsed_us,
+            "[PegaKVConnector] scheduler_lookup req=%s hit_blocks=%d computed_blocks=%d "
+            "hit_tokens=%d elapsed_us=%.0f",
+            req_id, hit_blocks, computed_blocks, num_hit_tokens, elapsed_us,
         )
         return (num_hit_tokens, False)
 
@@ -682,14 +1076,26 @@ class PegaKVConnector(KVConnectorBase_V1):
                 loaded from the external KV cache.
         """
         req_id = request.request_id
-        self._request_block_hashes[req_id] = request.block_hashes
+        tracker = self._trackers.get(req_id)
+        if tracker is None:
+            logger.warning("[PegaKVConnector] No tracker for request %s in update_state_after_alloc", req_id)
+            return
 
-        if num_external_tokens > 0:
-            self._requests_to_load[req_id] = {
-                'request': request,
-                'blocks': blocks,
-                'num_external_tokens': num_external_tokens,
-            }
+        # Extract block IDs from the allocation
+        block_ids = []
+        if blocks is not None:
+            raw_block_ids = blocks.get_block_ids()
+            if raw_block_ids:
+                # blocks.get_block_ids() returns tuple[list[int], ...] for each KV group
+                block_ids = list(raw_block_ids[0]) if raw_block_ids[0] else []
+
+        # Notify tracker of allocation
+        tracker.on_alloc(block_ids, num_external_tokens)
+
+        logger.debug(
+            "[PegaKVConnector] update_state_after_alloc req=%s blocks=%d external_tokens=%d phase=%s",
+            req_id, len(block_ids), num_external_tokens, tracker.phase.value,
+        )
 
     @timing_wrapper
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> KVConnectorMetadata:
@@ -702,50 +1108,78 @@ class PegaKVConnector(KVConnectorBase_V1):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
-        block_hashes = {}
+        load_intents: Dict[str, LoadIntent] = {}
+        save_intents: Dict[str, SaveIntent] = {}
 
         # Process new requests
         for req in scheduler_output.scheduled_new_reqs:
             req_id = req.req_id
-            if req_id in self._request_block_hashes:
-                block_hashes[req_id] = self._request_block_hashes[req_id]
+            tracker = self._trackers.get(req_id)
+            if tracker is None:
+                continue
 
-        # Process cached requests
-        for i, req_id in enumerate(scheduler_output.scheduled_cached_reqs.req_ids):
-            if req_id in self._request_block_hashes:
-                block_hashes[req_id] = self._request_block_hashes[req_id]
+            # Update scheduled tokens
+            num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            tracker.on_scheduled(num_tokens)
 
-        # Mark requests with block_hashes as being saved
-        for req_id, hashes in block_hashes.items():
-            if hashes:
-                self._requests_being_saved.add(req_id)
+            # Try to get load intent
+            if load_intent := tracker.consume_load_intent():
+                load_intents[req_id] = load_intent
 
-        # Process requests that need to load from CPU storage
-        requests_to_load = {}
-        for req_id, load_info in self._requests_to_load.items():
-            num_external_tokens = load_info['num_external_tokens']
+            # Try to get save intent
+            if save_intent := tracker.consume_save_intent():
+                save_intents[req_id] = save_intent
 
-            for req in scheduler_output.scheduled_new_reqs:
-                if req.req_id == req_id:
-                    block_ids = list(req.block_ids[0]) if req.block_ids else []
-                    num_blocks = (num_external_tokens + self._block_size - 1) // self._block_size
-                    saved_hashes = self._request_block_hashes.get(req_id, [])
-                    num_blocks = min(num_blocks, len(saved_hashes))
+        # Process cached requests (continuing generation)
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for idx, req_id in enumerate(cached_reqs.req_ids):
+            tracker = self._trackers.get(req_id)
+            if tracker is None:
+                continue
 
-                    if num_blocks > 0 and len(block_ids) >= num_blocks:
-                        requests_to_load[req_id] = {
-                            'block_ids': block_ids[:num_blocks],
-                            'block_hashes': saved_hashes[:num_blocks],
-                            'num_tokens': num_external_tokens,
-                        }
-                    break
+            # Update scheduled tokens from num_scheduled_tokens (not num_computed_tokens!)
+            num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            tracker.on_scheduled(num_tokens)
 
-        self._requests_to_load.clear()
+            # Update block IDs if new blocks were allocated
+            new_block_ids = cached_reqs.new_block_ids[idx]
+            if new_block_ids:
+                block_ids = list(new_block_ids[0]) if new_block_ids[0] else []
+                tracker.on_alloc(block_ids, 0)
+
+            # Try to get save intent
+            if save_intent := tracker.consume_save_intent():
+                save_intents[req_id] = save_intent
+
+        logger.debug(
+            "[PegaKVConnector] build_connector_meta: %d loads, %d saves",
+            len(load_intents), len(save_intents),
+        )
 
         return PegaConnectorMetadata(
-            block_hashes=block_hashes,
-            requests_to_load=requests_to_load,
+            load_intents=load_intents,
+            save_intents=save_intents,
         )
+
+    def _get_or_create_tracker(self, request: "Request") -> RequestTracker:
+        """
+        Get existing tracker or create a new one for the request.
+
+        Args:
+            request: The vLLM request object
+
+        Returns:
+            RequestTracker for this request
+        """
+        req_id = request.request_id
+        if req_id not in self._trackers:
+            self._trackers[req_id] = RequestTracker(
+                request_id=req_id,
+                block_hashes=list(request.block_hashes),
+                block_size=self._block_size,
+                num_layers=self._num_layers,
+            )
+        return self._trackers[req_id]
 
     def _count_available_block_prefix(self, block_hashes: List[bytes]) -> int:
         """

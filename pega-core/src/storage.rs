@@ -1,6 +1,7 @@
 use hashlink::LruCache;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
+use tracing::info;
 
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 
@@ -206,6 +207,8 @@ impl StorageEngine {
             };
             freed_entries += 1;
         }
+
+        info!("Reclaimed {} blocks from cache", freed_entries);
 
         freed_entries
     }

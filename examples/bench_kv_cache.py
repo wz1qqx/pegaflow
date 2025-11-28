@@ -38,7 +38,8 @@ class VLLMServer:
                  use_lmcache: bool = False, enable_prefix_caching: bool = False, 
                  log_file: Optional[Path] = None,
                  health_endpoints: Optional[Sequence[str]] = None,
-                 profile_output: Optional[Path] = None):
+                 profile_output: Optional[Path] = None,
+                 torch_profile_output: Optional[Path] = None):
         self.model = model
         self.port = port
         self.use_pegaflow = use_pegaflow
@@ -51,17 +52,23 @@ class VLLMServer:
             "/invocations",
         ]
         self.profile_output = profile_output
+        self.torch_profile_output = torch_profile_output
         self.process: Optional[subprocess.Popen] = None
         self.log_handle = None
         
     def __enter__(self):
         """Start the vLLM server."""
+        import os
+        env = os.environ.copy()
+
         # Set up LMCache environment variables if using LMCache
         if self.use_lmcache:
-            import os
-            os.environ["LMCACHE_CHUNK_SIZE"] = "256"
-            os.environ["LMCACHE_LOCAL_CPU"] = "True"
-            os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "32.0"
+            env["LMCACHE_CHUNK_SIZE"] = "256"
+            env["LMCACHE_LOCAL_CPU"] = "True"
+            env["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "32.0"
+        
+        if self.torch_profile_output:
+            env["VLLM_TORCH_PROFILER_DIR"] = str(self.torch_profile_output)
         
         cmd = []
         if self.profile_output:
@@ -76,6 +83,8 @@ class VLLMServer:
             "--port", str(self.port),
             "--trust-remote-code",
             "--data-parallel-size", "1",
+            # set chunk prefill to 1024
+            "--max-num-batched-tokens", "10240",
             "--prefix-caching-hash-algo", "sha256_cbor",
         ])
 
@@ -117,6 +126,7 @@ class VLLMServer:
                 cmd,
                 stdout=self.log_handle,
                 stderr=subprocess.STDOUT,  # Merge stderr into stdout
+                env=env,
             )
         else:
             with open('/dev/null', 'w') as devnull:
@@ -124,6 +134,7 @@ class VLLMServer:
                     cmd,
                     stdout=devnull,
                     stderr=devnull,
+                    env=env,
                 )
         
         # Wait for server to be ready
@@ -296,13 +307,13 @@ def main():
     parser.add_argument(
         "--num-prompts",
         type=int,
-        default=20,
+        default=8,
         help="Number of prompts to benchmark (default: 20)"
     )
     parser.add_argument(
         "--input-len",
         type=int,
-        default=2048,
+        default=10000,
         help="Input prompt length in tokens (default: 1024)"
     )
     parser.add_argument(
@@ -332,7 +343,7 @@ def main():
     parser.add_argument(
         "--request-rate",
         type=float,
-        default=1.0,
+        default=4.0,
         help="Request rate in requests per second. Use 1.0 to send requests one by one. "
              "Use 'inf' for sending all at once (default: 1.0)"
     )
@@ -353,6 +364,11 @@ def main():
         "--profile",
         action="store_true",
         help="Enable nsys profiling for the vLLM server. Profiling results will be saved to the output directory."
+    )
+    parser.add_argument(
+        "--torch-profile",
+        action="store_true",
+        help="Enable torch profiling (warm run only)"
     )
 
     args = parser.parse_args()
@@ -424,9 +440,11 @@ def main():
 
     pegaflow_log = run_dir / "pegaflow_server.log"
     profile_path = run_dir / "pegaflow" if args.profile else None
+    torch_profile_path = run_dir / "pegaflow_torch_trace" if args.torch_profile else None
     with VLLMServer(args.model, args.pegaflow_port, use_pegaflow=True,
                     enable_prefix_caching=False, log_file=pegaflow_log,
-                    profile_output=profile_path):
+                    profile_output=profile_path,
+                    torch_profile_output=torch_profile_path):
         # Cold cache run
         result_file = run_dir / "pegaflow_cold.json"
         all_results["pegaflow_cold"] = run_benchmark(
@@ -435,11 +453,21 @@ def main():
         )
 
         # Warm cache run (same requests again - using same seed for identical requests)
+        if args.torch_profile:
+            import requests
+            print("Starting torch profile...")
+            requests.post(f"http://localhost:{args.pegaflow_port}/start_profile")
+
         result_file = run_dir / "pegaflow_warm.json"
         all_results["pegaflow_warm"] = run_benchmark(
             args.model, args.pegaflow_port, args.num_prompts, args.input_len,
             args.output_len, result_file, "pegaflow_warm", args.request_rate, args.seed
         )
+
+        if args.torch_profile:
+            import requests
+            print("Stopping torch profile...")
+            requests.post(f"http://localhost:{args.pegaflow_port}/stop_profile")
 
     # Save combined results
     combined_file = run_dir / "combined_results.json"
