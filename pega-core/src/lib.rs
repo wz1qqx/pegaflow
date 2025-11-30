@@ -450,7 +450,7 @@ impl PegaEngine {
             return Ok(());
         }
 
-        info!(
+        debug!(
             "Saving {} blocks for layer {layer_name} on instance {instance_id} rank {tp_rank}",
             blocks_to_save.len()
         );
