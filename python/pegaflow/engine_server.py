@@ -266,13 +266,15 @@ class PegaEngineServer:
             return {'status': 'error', 'message': str(e)}
 
     def _handle_save(self, payload: dict) -> dict:
-        """Handle SAVE command - save blocks to CPU storage.
+        """Handle SAVE command - batch save blocks to CPU storage.
 
         Args:
             payload: {
-                'layer_name': str,
-                'block_ids': list[int],
-                'block_hashes': list[bytes],
+                'saves': list of {
+                    'layer_name': str,
+                    'block_ids': list[int],
+                    'block_hashes': list[bytes],
+                }
             }
 
         Returns:
@@ -281,27 +283,30 @@ class PegaEngineServer:
         try:
             instance_id = self._require_instance_id(payload)
             tp_rank = self._require_tp_rank(payload)
-            layer_name = payload['layer_name']
-            block_ids = payload['block_ids']
-            block_hashes = payload['block_hashes']
+            saves_data = payload['saves']
 
-            self.engine.save_kv_blocks_from_ipc(
+            # Convert to list of tuples for Rust
+            saves = [
+                (s['layer_name'], s['block_ids'], s['block_hashes'])
+                for s in saves_data
+            ]
+
+            self.engine.batch_save_kv_blocks_from_ipc(
                 instance_id,
                 tp_rank,
-                layer_name,
-                block_ids,
-                block_hashes
+                saves
             )
 
+            total_blocks = sum(len(s['block_ids']) for s in saves_data)
             logger.debug(
-                "Saved %d blocks for layer '%s' (instance %s rank %d)",
-                len(block_ids), layer_name, instance_id, tp_rank
+                "Batch saved %d blocks across %d layers (instance %s rank %d)",
+                total_blocks, len(saves_data), instance_id, tp_rank
             )
 
             return {'status': 'success'}
 
         except Exception as e:
-            logger.error("Failed to save blocks: %s", e, exc_info=True)
+            logger.error("Failed to batch save blocks: %s", e, exc_info=True)
             return {'status': 'error', 'message': str(e)}
 
     def _handle_load(self, payload: dict) -> dict:

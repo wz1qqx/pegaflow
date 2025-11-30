@@ -601,7 +601,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         return response
 
     def _save_worker(self) -> None:
-        """Background worker for handling async save requests."""
+        """Background worker for handling async save requests with batching."""
         context = zmq.Context()
         socket = context.socket(zmq.REQ)
         socket.setsockopt(zmq.RCVTIMEO, 20000)
@@ -611,18 +611,36 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         try:
             while True:
+                # Block wait for first task
                 task = self._save_queue.get()
                 if task is None:
                     self._save_queue.task_done()
                     break
 
+                # Batch pop: collect all available tasks
+                batch = [task]
+                while True:
+                    try:
+                        t = self._save_queue.get_nowait()
+                        if t is None:
+                            # Got shutdown signal, process batch then exit
+                            self._process_save_batch(batch, socket)
+                            self._save_queue.task_done()
+                            return
+                        batch.append(t)
+                    except queue.Empty:
+                        break
+
                 try:
-                    self._process_save_task(task, socket)
+                    self._process_save_batch(batch, socket)
                 except Exception as e:
                     logger.error(f"[PegaKVConnector] Save worker error: {e}", exc_info=True)
                     self._save_exception = e
                 finally:
-                    self._save_queue.task_done()
+                    # Mark all tasks as done
+                    for _ in batch:
+                        self._save_queue.task_done()
+
         except Exception as e:
             logger.critical(f"[PegaKVConnector] Save worker crashed: {e}", exc_info=True)
             self._save_exception = e
@@ -631,48 +649,67 @@ class PegaKVConnector(KVConnectorBase_V1):
             context.term()
             logger.info("[PegaKVConnector] Save worker thread stopped")
 
-    def _process_save_task(self, task: dict, socket: zmq.Socket) -> None:
-        """Process a single save task in the worker thread."""
-        layer_name = task['layer_name']
-        attn_metadata = task['attn_metadata']
-        metadata: PegaConnectorMetadata = task['metadata']
-        request_ids = task.get('request_ids', [])
-
-        if attn_metadata.block_table is None:
-            # Still need to decrement counter even if no blocks to save
-            self._decrement_layer_counter(request_ids)
+    def _process_save_batch(self, batch: list[dict], socket: zmq.Socket) -> None:
+        """Process a batch of save tasks, sending them in a single request."""
+        if not batch:
             return
 
-        try:
-            # Common payload fields
-            payload_base = {
-                "instance_id": self._instance_id,
-                "layer_name": layer_name,
-            }
-            if self._tp_rank is not None:
-                payload_base["tp_rank"] = self._tp_rank
-            if self._device_id is not None:
-                payload_base["device_id"] = self._device_id
+        # Aggregate saves from all tasks
+        # Key: (layer_name) -> {'block_ids': [], 'block_hashes': []}
+        saves_by_layer: Dict[str, Dict[str, list]] = {}
+        all_request_ids: list[str] = []
 
-            # Process each save intent
+        for task in batch:
+            metadata: PegaConnectorMetadata = task['metadata']
+            attn_metadata = task['attn_metadata']
+            layer_name = task['layer_name']
+            request_ids = task.get('request_ids', [])
+
+            all_request_ids.extend(request_ids)
+
+            if attn_metadata.block_table is None:
+                continue
+
             for _, save_intent in metadata.save_intents.items():
                 if not save_intent.block_ids:
                     continue
 
-                # Send SAVE request using intent data directly
-                payload = payload_base.copy()
-                payload.update({
-                    'block_ids': list(save_intent.block_ids),
-                    'block_hashes': list(save_intent.block_hashes),
-                })
-                self._zmq_send_recv(socket, 'SAVE', payload)
+                if layer_name not in saves_by_layer:
+                    saves_by_layer[layer_name] = {'block_ids': [], 'block_hashes': []}
 
-        except Exception as e:
-            logger.error(f"[PegaKVConnector] Save failed for layer {layer_name}: {e}", exc_info=True)
-            # Continue processing even on failure (mark failed but continue)
+                saves_by_layer[layer_name]['block_ids'].extend(save_intent.block_ids)
+                saves_by_layer[layer_name]['block_hashes'].extend(save_intent.block_hashes)
 
-        # Update completion tracking (success or failure, always decrement)
-        self._decrement_layer_counter(request_ids)
+        # Send batch request if there are saves
+        if saves_by_layer:
+            saves_list = [
+                {
+                    'layer_name': layer_name,
+                    'block_ids': list(data['block_ids']),
+                    'block_hashes': list(data['block_hashes']),
+                }
+                for layer_name, data in saves_by_layer.items()
+            ]
+
+            payload = {
+                'instance_id': self._instance_id,
+                'saves': saves_list,
+            }
+            if self._tp_rank is not None:
+                payload['tp_rank'] = self._tp_rank
+            if self._device_id is not None:
+                payload['device_id'] = self._device_id
+
+            self._zmq_send_recv(socket, 'SAVE', payload)
+
+            logger.info(
+                "[PegaKVConnector] Batch saved %d layers, %d total blocks",
+                len(saves_list),
+                sum(len(s['block_ids']) for s in saves_list),
+            )
+
+        # Update completion tracking for all requests in batch
+        self._decrement_layer_counter(all_request_ids)
 
     def _decrement_layer_counter(self, request_ids: list[str]) -> None:
         """Decrement layer counter for requests and mark as completed if all layers done."""

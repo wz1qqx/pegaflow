@@ -386,12 +386,57 @@ impl PegaEngine {
         Ok(())
     }
 
+    /// Batch save KV blocks from multiple layers.
+    ///
+    /// Each element in `saves` is a tuple of (layer_name, block_ids, block_hashes).
+    /// This is more efficient than calling save_kv_blocks_from_ipc in a loop
+    /// as it reduces Python-Rust boundary crossings.
+    #[instrument(
+        level = "info",
+        skip(self, saves),
+        fields(instance=%instance_id, rank=%tp_rank, layers=%saves.len())
+    )]
+    pub fn batch_save_kv_blocks_from_ipc(
+        &self,
+        instance_id: &str,
+        tp_rank: usize,
+        saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
+    ) -> Result<(), EngineError> {
+        for (layer_name, block_ids, block_hashes) in saves {
+            self.save_kv_blocks_from_ipc_inner(
+                instance_id,
+                tp_rank,
+                &layer_name,
+                block_ids,
+                block_hashes,
+            )?;
+        }
+        Ok(())
+    }
+
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
         fields(instance=%instance_id, rank=%tp_rank, layer=%layer_name, blocks=%block_ids.len())
     )]
     pub fn save_kv_blocks_from_ipc(
+        &self,
+        instance_id: &str,
+        tp_rank: usize,
+        layer_name: &str,
+        block_ids: Vec<i32>,
+        block_hashes: Vec<Vec<u8>>,
+    ) -> Result<(), EngineError> {
+        self.save_kv_blocks_from_ipc_inner(
+            instance_id,
+            tp_rank,
+            layer_name,
+            block_ids,
+            block_hashes,
+        )
+    }
+
+    fn save_kv_blocks_from_ipc_inner(
         &self,
         instance_id: &str,
         tp_rank: usize,
@@ -481,10 +526,6 @@ impl PegaEngine {
                 k_offsets_with_idx.push((k_offset, i));
                 v_offsets_with_idx.push((v_offset, i));
             }
-
-            // Sort by GPU offset to find contiguous ranges
-            k_offsets_with_idx.sort_by_key(|&(offset, _)| offset);
-            v_offsets_with_idx.sort_by_key(|&(offset, _)| offset);
 
             // Batch copy K segments
             transfer::batch_copy_segments(
