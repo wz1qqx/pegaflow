@@ -201,6 +201,7 @@ def run_benchmark(model: str, port: int, num_prompts: int, input_len: int, outpu
         "--num-prompts", str(num_prompts),
         "--request-rate", str(request_rate),  # Control request arrival rate
         "--seed", str(seed),  # Fixed seed for reproducible requests
+        "--ready-check-timeout", "0",  # Skip endpoint ready check to avoid extra requests
         "--save-result",
         "--result-filename", result_file.name,
         "--result-dir", str(result_file.parent),
@@ -307,14 +308,14 @@ def main():
     parser.add_argument(
         "--num-prompts",
         type=int,
-        default=8,
+        default=20,
         help="Number of prompts to benchmark (default: 20)"
     )
     parser.add_argument(
         "--input-len",
         type=int,
-        default=10000,
-        help="Input prompt length in tokens (default: 1024)"
+        default=2048,
+        help="Input prompt length in tokens (default: 2048)"
     )
     parser.add_argument(
         "--output-len",

@@ -68,9 +68,7 @@ def main():
         "--tensor-parallel-size", str(args.tensor_parallel_size),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--trust-remote-code",
-        "--enforce-eager",
         "--no-enable-prefix-caching",
-        "--disable-log-requests",
         "--kv-transfer-config", json.dumps(kv_transfer_config),
     ]
 

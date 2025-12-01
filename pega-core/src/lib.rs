@@ -392,7 +392,7 @@ impl PegaEngine {
     /// This is more efficient than calling save_kv_blocks_from_ipc in a loop
     /// as it reduces Python-Rust boundary crossings.
     #[instrument(
-        level = "info",
+        level = "debug",
         skip(self, saves),
         fields(instance=%instance_id, rank=%tp_rank, layers=%saves.len())
     )]
@@ -672,20 +672,11 @@ impl PegaEngine {
             let mut total_blocks = 0usize;
 
             for layer_name in &layer_names {
-                let layer_id = match instance.get_layer_id(layer_name) {
-                    Some(id) => id,
-                    None => continue,
-                };
+                let layer_id = instance.get_layer_id(layer_name).unwrap();
 
-                let registration = match worker.get_registration(layer_name) {
-                    Some(reg) => reg,
-                    None => continue,
-                };
+                let registration = worker.get_registration(layer_name).unwrap();
 
-                let slot_id = match instance.get_slot_index(layer_id, tp_rank) {
-                    Ok(id) => id,
-                    Err(_) => continue,
-                };
+                let slot_id = instance.get_slot_index(layer_id, tp_rank).unwrap();
 
                 // Collect valid blocks to load for this layer
                 let blocks_to_load: Vec<_> = block_ids

@@ -144,3 +144,59 @@ def append_n(self, blocks: list[KVCacheBlock]) -> None:
 ```
 
 This simple change can noticeably reduce transfer latency by enabling more efficient memory access patterns during KV cache operations.
+
+## P/D Disaggregation
+
+PegaFlow supports Prefill/Decode (P/D) disaggregation, where prefill and decode phases run on separate GPU nodes. A lightweight router coordinates the flow: requests first go to P nodes for prefill (KV cache generation), then to D nodes for decode (token generation).
+
+### Architecture
+
+```
+Client Request
+      │
+      ▼
+   Router (:8000)
+      │
+      ├──► P Node (:8100) ─── prefill, generate KV cache ───┐
+      │                                                     │
+      │                                                     ▼
+      │                                              PegaEngine Server
+      │                                            (centralized KV store)
+      │                                                     │
+      └──► D Node (:8200) ◄─── load KV cache ───────────────┘
+               │
+               ▼
+        Response to Client
+```
+
+### Quick Start
+
+1. Start the PegaEngine server (centralized KV cache storage):
+
+   ```bash
+   ./scripts/start_pega_engine.sh --device 0
+   ```
+
+2. Launch P/D setup:
+
+   ```bash
+   uv run python examples/run_vllm_pd_with_pega.py --model Qwen/Qwen3-8B
+   ```
+
+3. Run benchmark:
+
+   ```bash
+   vllm bench serve --port 8000 --seed 42 \
+     --model Qwen/Qwen3-8B \
+     --dataset-name random --random-input-len 5000 --random-output-len 200 \
+     --num-prompts 200 --burstiness 100 --request-rate 1
+   ```
+
+### Benchmark Results (H800, Qwen3-8B, 5K input tokens)
+
+| Configuration | TTFT mean (ms) | TPOT mean (ms) | TPOT p99 (ms) | ITL p99 (ms) |
+|---------------|----------------|----------------|---------------|--------------|
+| P/D (1P+1D)   | 573.78         | 15.68          | 15.89         | 21.71        |
+| Baseline (DP2)| 438.24         | 22.67          | 24.32         | 142.70       |
+
+P/D disaggregation trades higher TTFT for **significantly more stable decode latency** — TPOT p99 drops from 24.32ms to 15.89ms, and ITL p99 improves dramatically from 142.70ms to 21.71ms.

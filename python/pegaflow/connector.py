@@ -232,18 +232,21 @@ class RequestTracker:
             hit_blocks: Number of blocks available in external storage
             computed_blocks: Number of blocks already computed locally (vLLM hit)
 
-        Raises:
-            AssertionError: If lookup was already done
+        Notes:
+            This method can be called multiple times by vLLM scheduler.
+            Each call updates the lookup state.
         """
-        assert not self._lookup_done, f"lookup already done for {self.request_id}"
         old_phase = self.phase
         self._hit_blocks = hit_blocks
         self._computed_blocks = computed_blocks
-        self._lookup_done = True
-        logger.info(
-            "[RequestTracker] %s on_lookup: hit=%d computed=%d phase=%s->%s",
-            self.request_id, hit_blocks, computed_blocks, old_phase.value, self.phase.value,
-        )
+        
+        if not self._lookup_done:
+            # First lookup
+            self._lookup_done = True
+            logger.info(
+                "[RequestTracker] %s on_lookup: hit=%d computed=%d phase=%s->%s",
+                self.request_id, hit_blocks, computed_blocks, old_phase.value, self.phase.value,
+            )
 
     def on_alloc(self, block_ids: list[int], num_external_tokens: int) -> None:
         """
@@ -394,9 +397,10 @@ class RequestTracker:
         Check if blocks should be held (not freed) for async save.
 
         Returns:
-            True if request is finished but save is still in progress
+            True if request is finished and has blocks to save that aren't complete.
+            Uses _stored_blocks > 0 to detect if save intents were consumed (scheduler-side).
         """
-        return self._finished and self._saved_layers < self._total_layers
+        return self._finished and self._stored_blocks > 0 and self._saved_layers < self._total_layers
 
     def is_done(self) -> bool:
         """
@@ -539,6 +543,8 @@ class PegaKVConnector(KVConnectorBase_V1):
         # consumed in build_connector_meta. This is needed for async loading where
         # the request enters WAITING_FOR_REMOTE_KVS state before being scheduled.
         self._pending_load_intents: Dict[str, LoadIntent] = {}
+        # Requests whose blocks we told vLLM to hold while async save completes (scheduler side)
+        self._held_requests: set[str] = set()
 
         # Block size
         self._block_size = vllm_config.cache_config.block_size
@@ -548,6 +554,10 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._req_pending_layers: Dict[str, int] = {}  # req_id -> remaining layer count
         self._completed_saves: set[str] = set()  # req_ids with all layers saved
         self._save_completion_lock = threading.Lock()
+
+        # Track requests with save intents in current step (Worker side)
+        # Set in start_load_kv, checked in wait_for_save to detect skipped saves
+        self._current_save_intents: set[str] = set()
 
         # Async load tracking (Worker side)
         # Maps req_id -> PyLoadState for pending async loads
@@ -702,7 +712,7 @@ class PegaKVConnector(KVConnectorBase_V1):
 
             self._zmq_send_recv(socket, 'SAVE', payload)
 
-            logger.info(
+            logger.debug(
                 "[PegaKVConnector] Batch saved %d layers, %d total blocks",
                 len(saves_list),
                 sum(len(s['block_ids']) for s in saves_list),
@@ -713,6 +723,8 @@ class PegaKVConnector(KVConnectorBase_V1):
 
     def _decrement_layer_counter(self, request_ids: list[str]) -> None:
         """Decrement layer counter for requests and mark as completed if all layers done."""
+        completed_reqs: list[str] = []
+
         with self._save_completion_lock:
             for req_id in request_ids:
                 if req_id in self._req_pending_layers:
@@ -726,7 +738,31 @@ class PegaKVConnector(KVConnectorBase_V1):
                         # All layers processed, mark request complete
                         self._completed_saves.add(req_id)
                         del self._req_pending_layers[req_id]
-                        logger.info(f"[PegaKVConnector] Request {req_id} all {len(self._registered_layers)} layers saved")
+                        completed_reqs.append(req_id)
+
+        self._handle_save_completion(completed_reqs)
+
+    def _handle_save_completion(self, request_ids: Iterable[str], reason: str | None = None) -> None:
+        """
+        Log save completion for requests.
+
+        Args:
+            request_ids: Iterable of request ids that have finished saving.
+            reason: Optional suffix describing why completion was triggered.
+        """
+        req_list = list(request_ids)
+        if not req_list:
+            return
+
+        suffix = "" if not reason else f" ({reason})"
+        layer_count = len(self._registered_layers) or self._num_layers
+        for req_id in req_list:
+            logger.info(
+                "[PegaKVConnector] Request %s all %d layers saved%s",
+                req_id,
+                layer_count,
+                suffix,
+            )
 
     # ==============================
     # Worker-side methods
@@ -879,7 +915,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         """
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, PegaConnectorMetadata):
+            self._current_save_intents = set()
             return
+
+        # Record save intents for this step (used by wait_for_save to detect skipped saves)
+        self._current_save_intents = set(metadata.save_intents.keys())
 
         if not metadata.load_intents:
             return
@@ -997,15 +1037,36 @@ class PegaKVConnector(KVConnectorBase_V1):
     @timing_wrapper
     def wait_for_save(self) -> None:
         """
-        Non-blocking check for save errors.
-        Actual save completion is tracked via get_finished().
+        Non-blocking check for save errors and skipped saves.
 
-        This prevents overwrites of paged KV buffer before saving done.
+        Detects requests that had save intents but save_kv_layer() was never called
+        (e.g., due to CUDA graph), and marks them as completed to avoid deadlock.
         """
+        skipped_requests: set[str] = set()
+
         with self._save_completion_lock:
+            pending_layers = set(self._req_pending_layers.keys())
+            # Detect skipped saves: requests with save intent but not in pending layers
+            # This happens when CUDA graph skips save_kv_layer()
+            skipped_requests = self._current_save_intents - pending_layers
+            if skipped_requests:
+                # Mark skipped saves as completed
+                self._completed_saves.update(skipped_requests)
+
+            # Clear for next step
+            self._current_save_intents = set()
+
             pending_reqs = len(self._req_pending_layers)
             if pending_reqs > 0:
                 logger.info(f"[PegaKVConnector] {pending_reqs} requests still have pending layer saves")
+
+        if skipped_requests:
+            logger.info(
+                "[PegaKVConnector] Detected %d skipped saves (CUDA graph): %s",
+                len(skipped_requests),
+                skipped_requests,
+            )
+            self._handle_save_completion(skipped_requests, reason="CUDA graph skip")
 
 
     # ==============================
@@ -1062,6 +1123,8 @@ class PegaKVConnector(KVConnectorBase_V1):
 
             # Check if we need to hold blocks for async save
             if tracker.should_hold_blocks():
+                # Track this request so get_finished() can report it later
+                self._held_requests.add(req_id)
                 logger.info(f"[PegaKVConnector] Request {req_id} blocks held for async save")
                 return (True, None)
 

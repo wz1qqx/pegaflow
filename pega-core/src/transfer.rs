@@ -1,5 +1,5 @@
 use cudarc::driver::CudaStream;
-use tracing::{debug, info, instrument};
+use tracing::{debug, instrument};
 
 use crate::KVCacheRegistration;
 
@@ -240,7 +240,7 @@ pub(crate) fn batch_copy_segments_to_gpu(
 
     let total_breaks = gpu_discontinuous_count + cpu_discontinuous_count + both_discontinuous_count;
     if total_breaks > 0 {
-        info!(
+        debug!(
             "CPU->GPU batch merge breaks: {} total (GPU discontinuous: {}, CPU discontinuous: {}, both: {})",
             total_breaks,
             gpu_discontinuous_count,

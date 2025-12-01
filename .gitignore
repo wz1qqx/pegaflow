@@ -12,6 +12,7 @@ __pycache__/
 venv/
 .pytest_cache/
 examples/bench_results/
+examples/pd_logs/
 
 # IDE
 .vscode/
