@@ -1,10 +1,10 @@
 [package]
-name = "engine-server"
+name = "pegaflow-server"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-pega-core.workspace = true
+pegaflow-core.workspace = true
 prost.workspace = true
 pyo3 = { workspace = true, features = ["auto-initialize"] }
 cudarc.workspace = true

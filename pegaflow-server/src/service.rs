@@ -6,7 +6,7 @@ use crate::proto::engine::{
 };
 use crate::registry::{CudaTensorRegistry, TensorMetadata};
 use parking_lot::Mutex;
-use pega_core::{EngineError, PegaEngine};
+use pegaflow_core::{EngineError, PegaEngine};
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
 use tokio::sync::Notify;

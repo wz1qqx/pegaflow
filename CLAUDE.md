@@ -32,7 +32,7 @@ cargo bench --bench bincode_msg
 ### Running Examples
 ```bash
 # Start the PegaEngine server first (required)
-./scripts/start_pega_engine.sh --device 0
+cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0
 
 # Then run examples
 uv run python examples/basic_vllm.py
@@ -43,7 +43,7 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 
 ### Three-Layer Design
 
-1. **pega-core** (Rust): Core storage engine
+1. **pegaflow-core** (Rust): Core storage engine
    - `PegaEngine`: Main engine managing instances, workers, and KV cache storage
    - `StorageEngine`: Pinned memory allocator + block cache
    - `transfer`: GPU-CPU transfer operations via CUDA
@@ -51,7 +51,7 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 
 2. **python/src/lib.rs** (Rust/PyO3): Python bindings
    - Exposes `PegaEngine` and `PyLoadState` to Python
-   - All methods delegate to pega-core
+   - All methods delegate to pegaflow-core
 
 3. **python/pegaflow/** (Python): vLLM integration
    - `connector.py`: `PegaKVConnector` (vLLM v1 KV connector)
@@ -84,7 +84,7 @@ vLLM Worker <--ZMQ--> PegaEngine Server <--CUDA IPC--> GPU Memory
 
 - `PEGAFLOW_ENGINE_ENDPOINT`: ZMQ endpoint (default: `ipc:///tmp/pega_engine.sock`)
 - `PEGAFLOW_INSTANCE_ID`: Override instance ID
-- `RUST_LOG`: Control Rust logging (e.g., `info,pega_core=debug`)
+- `RUST_LOG`: Control Rust logging (e.g., `info,pegaflow_core=debug,pegaflow_server=debug`)
 
 ## vLLM Integration
 
@@ -101,6 +101,6 @@ kv_transfer_config = KVTransferConfig(
 
 ## Key Files
 
-- `pega-core/src/lib.rs`: Main PegaEngine implementation
+- `pegaflow-core/src/lib.rs`: Main PegaEngine implementation
 - `python/pegaflow/connector.py`: vLLM KV connector with RequestTracker state machine
 - `python/pegaflow/engine_server.py`: ZMQ server for multi-process access

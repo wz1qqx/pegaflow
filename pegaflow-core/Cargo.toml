@@ -1,5 +1,5 @@
 [package]
-name = "pega-core"
+name = "pegaflow-core"
 version.workspace = true
 edition.workspace = true
 

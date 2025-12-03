@@ -367,25 +367,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
-name = "engine-server"
-version = "0.1.0"
-dependencies = [
- "clap",
- "cudarc",
- "parking_lot",
- "pega-core",
- "prost",
- "pyo3",
- "pyo3-build-config",
- "tokio",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -910,7 +891,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pega-core"
+name = "pegaflow-core"
 version = "0.1.0"
 dependencies = [
  "bincode",
@@ -929,11 +910,30 @@ dependencies = [
 name = "pegaflow-py"
 version = "0.0.1"
 dependencies = [
- "engine-server",
- "pega-core",
+ "pegaflow-core",
+ "pegaflow-server",
  "pyo3",
  "tokio",
  "tonic",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "pegaflow-server"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "cudarc",
+ "parking_lot",
+ "pegaflow-core",
+ "prost",
+ "pyo3",
+ "pyo3-build-config",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
  "tracing-subscriber",
 ]
 

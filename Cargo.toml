@@ -1,5 +1,5 @@
 [workspace]
-members = ["pega-core", "python", "engine-server"]
+members = ["pegaflow-core", "python", "pegaflow-server"]
 resolver = "2"
 
 [workspace.package]
@@ -8,7 +8,7 @@ edition = "2021"
 
 [workspace.dependencies]
 # Workspace members
-pega-core = { path = "pega-core" }
+pegaflow-core = { path = "pegaflow-core" }
 
 # Core dependencies
 cudarc = { version = "0.18.0", features = ["cuda-12040"] }

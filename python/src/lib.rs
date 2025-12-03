@@ -1,8 +1,8 @@
-use engine_server::proto::engine::{
+use pegaflow_server::proto::engine::{
     engine_client::EngineClient, HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest,
     ResponseStatus, SaveLayer, SaveRequest, ShutdownRequest, UnregisterRequest,
 };
-use pega_core::{LoadState, PegaEngine as CoreEngine};
+use pegaflow_core::{LoadState, PegaEngine as CoreEngine};
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 use std::{
     future::Future,
@@ -43,7 +43,7 @@ fn init_tracing() {
     INIT_TRACING.call_once(|| {
         // Default to info for most crates, debug for core if RUST_LOG not set.
         let env_filter = EnvFilter::try_from_default_env()
-            .or_else(|_| "info,pega_core=info".parse())
+            .or_else(|_| "info,pegaflow_core=info".parse())
             .unwrap_or_else(|_| EnvFilter::new("info"));
 
         let fmt_layer = tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE);

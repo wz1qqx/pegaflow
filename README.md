@@ -77,10 +77,10 @@ We now ship a working vLLM v1 connector example plus a companion benchmark so yo
 3. Start the PegaEngine server (required before running examples):
 
    ```bash
-   ./scripts/start_pega_engine.sh --device 0
+   cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0
    ```
 
-   This starts the PegaEngine server that handles KV cache operations. Keep it running in a separate terminal.
+   This starts the PegaEngine gRPC server that handles KV cache operations. Keep it running in a separate terminal.
 
 4. Build the PyO3 bindings via maturin:
 
@@ -174,7 +174,7 @@ Client Request
 1. Start the PegaEngine server (centralized KV cache storage):
 
    ```bash
-   ./scripts/start_pega_engine.sh --device 0
+   cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0
    ```
 
 2. Launch P/D setup:
