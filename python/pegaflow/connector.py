@@ -241,7 +241,7 @@ class RequestTracker:
         if not self._lookup_done:
             # First lookup
             self._lookup_done = True
-            logger.info(
+            logger.debug(
                 "[RequestTracker] %s on_lookup: hit=%d computed=%d phase=%s->%s",
                 self.request_id, hit_blocks, computed_blocks, old_phase.value, self.phase.value,
             )
@@ -259,7 +259,7 @@ class RequestTracker:
         if num_external_tokens > 0:
             self._external_tokens = num_external_tokens
         if block_ids:
-            logger.info(
+            logger.debug(
                 "[RequestTracker] %s on_alloc: +%d blocks (total=%d) external_tokens=%d phase=%s->%s",
                 self.request_id, len(block_ids), len(self._allocated_blocks),
                 self._external_tokens, old_phase.value, self.phase.value,
@@ -345,7 +345,7 @@ class RequestTracker:
             block_hashes=self._block_hashes[start:end],
             num_tokens=load_blocks * self._block_size,
         )
-        logger.info(
+        logger.debug(
             "[RequestTracker] %s consume_load_intent: %d blocks [%d:%d] phase=%s->%s",
             self.request_id, load_blocks, start, end, old_phase.value, self.phase.value,
         )
@@ -382,7 +382,7 @@ class RequestTracker:
             block_ids=tuple(self._allocated_blocks[start:end]),
             block_hashes=self._block_hashes[start:end],
         )
-        logger.info(
+        logger.debug(
             "[RequestTracker] %s consume_save_intent: %d blocks [%d:%d] total_stored=%d",
             self.request_id, new_blocks, start, end, self._stored_blocks,
         )
@@ -703,7 +703,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         suffix = "" if not reason else f" ({reason})"
         layer_count = len(self._registered_layers) or self._num_layers
         for req_id in req_list:
-            logger.info(
+            logger.debug(
                 "[PegaKVConnector] Request %s all %d layers saved%s",
                 req_id,
                 layer_count,
@@ -765,7 +765,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                         )
                         # TODO: report invalid_block_ids
                     else:
-                        logger.info(
+                        logger.debug(
                             "[PegaKVConnector] async load completed for %d reqs, shm=%s",
                             len(req_ids), shm_name,
                         )
@@ -782,9 +782,9 @@ class PegaKVConnector(KVConnectorBase_V1):
                 finished_recving = completed_reqs
 
         if finished_sending:
-            logger.info(f"[PegaKVConnector] finished saving KV for requests: {finished_sending}")
+            logger.debug(f"[PegaKVConnector] finished saving KV for requests: {finished_sending}")
         if finished_recving:
-            logger.info(f"[PegaKVConnector] finished loading KV for requests: {finished_recving}")
+            logger.debug(f"[PegaKVConnector] finished loading KV for requests: {finished_recving}")
 
         return (finished_sending, finished_recving)
 
@@ -925,7 +925,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                 self._pending_loads[req_id] = load_state
             self._pending_load_reqs[shm_name] = set(request_ids)
 
-        logger.info(
+        logger.debug(
             "[PegaKVConnector] started async load: %d blocks across %d layers for %d reqs, "
             "schedule %.0f us, shm=%s",
             num_blocks, num_layers, total_requests, schedule_time_us, shm_name,
@@ -1011,10 +1011,10 @@ class PegaKVConnector(KVConnectorBase_V1):
 
             pending_reqs = len(self._req_pending_layers)
             if pending_reqs > 0:
-                logger.info(f"[PegaKVConnector] {pending_reqs} requests still have pending layer saves")
+                logger.debug(f"[PegaKVConnector] {pending_reqs} requests still have pending layer saves")
 
         if skipped_requests:
-            logger.info(
+            logger.debug(
                 "[PegaKVConnector] Detected %d skipped saves (CUDA graph): %s",
                 len(skipped_requests),
                 skipped_requests,
@@ -1041,7 +1041,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                 # Mark all layers as saved (worker confirmed completion)
                 while tracker._saved_layers < tracker._total_layers:
                     tracker.on_layer_saved()
-                logger.info(f"[PegaKVConnector] Request {req_id} save completed, phase={tracker.phase.value}")
+                logger.debug(f"[PegaKVConnector] Request {req_id} save completed, phase={tracker.phase.value}")
 
                 # Clean up tracker if fully done
                 if tracker.is_done():
@@ -1078,7 +1078,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             if tracker.should_hold_blocks():
                 # Track this request so get_finished() can report it later
                 self._held_requests.add(req_id)
-                logger.info(f"[PegaKVConnector] Request {req_id} blocks held for async save")
+                logger.debug(f"[PegaKVConnector] Request {req_id} blocks held for async save")
                 return (True, None)
 
         return (False, None)
@@ -1154,11 +1154,19 @@ class PegaKVConnector(KVConnectorBase_V1):
         if num_hit_tokens >= num_tokens:
             num_hit_tokens = num_tokens - 1
 
+        need_to_compute_tokens = num_tokens - num_hit_tokens
+
         logger.info(
-            "[PegaKVConnector] scheduler_lookup req=%s hit_blocks=%d computed_blocks=%d "
-            "hit_tokens=%d elapsed_us=%.0f async=True",
-            req_id, hit_blocks, computed_blocks, num_hit_tokens, elapsed_us,
+            "[PegaKVConnector] hit_blocks=%d computed_blocks=%d need_to_compute_tokens=%d "
+            "hit_tokens=%d elapsed_us=%.0f for request %s",
+            hit_blocks,
+            computed_blocks,
+            need_to_compute_tokens,
+            num_hit_tokens,
+            elapsed_us,
+            req_id,
         )
+        
         return (num_hit_tokens, True)  # async loading enabled
 
     @timing_wrapper
@@ -1207,7 +1215,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             load_intent = tracker.consume_load_intent()
             if load_intent is not None:
                 self._pending_load_intents[req_id] = load_intent
-                logger.info(
+                logger.debug(
                     "[PegaKVConnector] update_state_after_alloc req=%s created LoadIntent: "
                     "%d blocks, %d tokens",
                     req_id, len(load_intent.block_ids), load_intent.num_tokens,
