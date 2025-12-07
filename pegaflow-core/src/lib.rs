@@ -40,7 +40,7 @@ use tracing::{debug, info, instrument};
 
 use crate::storage::{LayerBlock, StorageEngine};
 
-const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 10GB
+const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 30GB
 
 #[derive(Debug)]
 pub enum EngineError {

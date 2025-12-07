@@ -68,12 +68,6 @@ impl PinnedMemoryPool {
         let allocator = ScaledOffsetAllocator::new(pool_size as u64)
             .expect("Failed to create memory allocator");
 
-        info!(
-            "Allocated pinned memory pool: {} GB ({} bytes)",
-            pool_size as f64 / 1e9,
-            pool_size
-        );
-
         Self {
             base_ptr,
             allocator: Mutex::new(allocator),

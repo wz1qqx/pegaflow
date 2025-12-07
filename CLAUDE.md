@@ -32,12 +32,17 @@ cargo bench --bench bincode_msg
 ### Running Examples
 ```bash
 # Start the PegaEngine server first (required)
-cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0
+cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
 
 # Then run examples
 uv run python examples/basic_vllm.py
 uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 ```
+
+**Server Configuration:**
+- `--addr`: Bind address (default: `127.0.0.1:50055`)
+- `--device`: CUDA device ID (default: `0`)
+- `--pool-size`: Pinned memory pool size (default: `30gb`, supports: `kb`, `mb`, `gb`, `tb`)
 
 ## Architecture
 

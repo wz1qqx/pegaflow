@@ -1,3 +1,5 @@
+mod utils;
+
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
 use parking_lot::Mutex;
@@ -13,6 +15,8 @@ use tonic::transport::Server;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+use utils::parse_memory_size;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "pega-engine-server",
@@ -26,6 +30,11 @@ struct Cli {
     /// Default CUDA device to bind for server-managed contexts
     #[arg(long, default_value_t = 0)]
     device: i32,
+
+    /// Pinned memory pool size (supports units: kb, mb, gb, tb)
+    /// Examples: "10gb", "500mb", "1tb"
+    #[arg(long, default_value = "30gb", value_parser = parse_memory_size)]
+    pool_size: usize,
 }
 
 fn init_tracing() {
@@ -90,7 +99,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
     })?;
     let registry = Arc::new(Mutex::new(registry));
-    let engine = Arc::new(PegaEngine::new());
+
+    info!(
+        "Creating PegaEngine with pinned memory pool: {:.2} GiB ({} bytes)",
+        cli.pool_size as f64 / (1024.0 * 1024.0 * 1024.0),
+        cli.pool_size
+    );
+    let engine = Arc::new(PegaEngine::new_with_pool_size(cli.pool_size));
     let shutdown = Arc::new(Notify::new());
 
     let service = GrpcEngineService::new(engine, Arc::clone(&registry), Arc::clone(&shutdown));

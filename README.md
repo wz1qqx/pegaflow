@@ -77,10 +77,16 @@ We now ship a working vLLM v1 connector example plus a companion benchmark so yo
 3. Start the PegaEngine server (required before running examples):
 
    ```bash
-   cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0
+   cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
    ```
 
    This starts the PegaEngine gRPC server that handles KV cache operations. Keep it running in a separate terminal.
+
+   **Configuration Options:**
+   - `--addr`: Server bind address (default: `127.0.0.1:50055`)
+   - `--device`: CUDA device ID (default: `0`)
+   - `--pool-size`: Pinned memory pool size with unit suffix (default: `30gb`)
+     - Examples: `10gb`, `500mb`, `1.5tb`, `1073741824` (bytes)
 
 4. Build the PyO3 bindings via maturin:
 
@@ -174,9 +180,8 @@ Client Request
 1. Start the PegaEngine server (centralized KV cache storage):
 
    ```bash
-   cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0
+   cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
    ```
-
 2. Launch P/D setup:
 
    ```bash
