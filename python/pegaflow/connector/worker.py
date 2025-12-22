@@ -146,15 +146,15 @@ class WorkerConnector:
         with self._save_completion_lock:
             # 1. Add newly finished requests (if they have pending saves) to tracking
             self._finished_requests.update(finished_req_ids & self._req_pending_layers.keys())
-            
             # 2. Identify requests whose saves have completed
-            done_sends = self._completed_saves & self._finished_requests
+            done_saves = self._completed_saves & self._finished_requests
+            done_saves.update(self._completed_saves & finished_req_ids)
             
-            if done_sends:
+            if done_saves:
                 # 3. Clean up completed requests
-                self._completed_saves -= done_sends
-                self._finished_requests -= done_sends
-                finished_sending = done_sends
+                self._completed_saves -= done_saves
+                self._finished_requests -= done_saves
+                finished_sending = done_saves
             
 
         with self._load_completion_lock:

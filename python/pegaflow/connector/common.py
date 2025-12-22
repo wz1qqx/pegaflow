@@ -159,7 +159,6 @@ class RequestTracker:
 
     def on_lookup(self, hit_blocks: int, computed_blocks: int) -> None:
         """New lookup = fresh load state. Handles preemption implicitly."""
-        assert self._load is None
         self._load = (
             LoadState(hit_blocks=hit_blocks, computed_blocks=computed_blocks)
             if hit_blocks > computed_blocks

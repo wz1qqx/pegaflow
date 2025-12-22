@@ -93,17 +93,17 @@ class SchedulerConnector:
         block_ids = list(blocks.get_block_ids()[0]) if blocks else []
         tracker.on_alloc(block_ids, num_external_tokens)
 
-        if num_external_tokens > 0:
-            load_intent = tracker.consume_load_intent()
-            if load_intent is not None:
-                self._pending_load_intents[req_id] = load_intent
-                logger.debug(
-                    "[PegaKVConnector] update_state_after_alloc req=%s created LoadIntent: "
-                    "%d blocks, %d tokens",
-                    req_id,
-                    len(load_intent.block_ids),
-                    load_intent.num_tokens,
-                )
+        # Always consume to clear _load state, avoiding stale state on preemption
+        load_intent = tracker.consume_load_intent()
+        if load_intent is not None:
+            self._pending_load_intents[req_id] = load_intent
+            logger.debug(
+                "[PegaKVConnector] update_state_after_alloc req=%s created LoadIntent: "
+                "%d blocks, %d tokens",
+                req_id,
+                len(load_intent.block_ids),
+                load_intent.num_tokens,
+            )
 
         logger.debug(
             "[PegaKVConnector] update_state_after_alloc req=%s blocks=%d external_tokens=%d phase=%s",
