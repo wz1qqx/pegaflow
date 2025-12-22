@@ -28,7 +28,7 @@ use tracing::{debug, error};
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 
-const RECLAIM_BATCH_OBJECTS: usize = 256;
+const RECLAIM_BATCH_OBJECTS: usize = 4096;
 
 // A "slot" in this file refers to a specific position in the flattened logical storage,
 // calculated as `layer_id * tp_size + tp_rank`.
