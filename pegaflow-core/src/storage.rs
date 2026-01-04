@@ -7,22 +7,23 @@
 //
 // Architecture:
 // - Inflight: DashMap<BlockKey, Mutex<InflightBlock>> for concurrent writes
-// - Cache: LruCache<BlockKey, Arc<SealedBlock>> for read-only lookup + eviction
+// - Cache: TinyLFU-admitted LRU for read-only lookup + eviction
 // - Allocator: PinnedMemoryPool for pinned memory allocation
 //
 // Eviction only targets the cache; inflight blocks are never evicted.
 // ============================================================================
 use bytesize::ByteSize;
 use dashmap::DashMap;
-use hashlink::LruCache;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, error, info};
 
+use crate::cache::TinyLfuCache;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 
@@ -59,6 +60,31 @@ impl PreEvictConfig {
             threshold_bytes,
             target_bytes,
             check_interval_ms,
+        }
+    }
+}
+
+/// Configuration for cache + storage behavior.
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    pub pre_evict_config: PreEvictConfig,
+    pub enable_lfu_admission: bool,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            pre_evict_config: PreEvictConfig::default(),
+            enable_lfu_admission: true,
+        }
+    }
+}
+
+impl From<PreEvictConfig> for StorageConfig {
+    fn from(pre_evict_config: PreEvictConfig) -> Self {
+        Self {
+            pre_evict_config,
+            ..Default::default()
         }
     }
 }
@@ -185,6 +211,20 @@ impl SealedBlock {
     pub fn memory_footprint(&self) -> u64 {
         self.footprint
     }
+
+    /// Get all slots (for serialization)
+    pub fn slots(&self) -> &[Arc<LayerBlock>] {
+        &self.slots
+    }
+
+    /// Create from a vec of slots (for deserialization)
+    pub fn from_slots(slots: Vec<Arc<LayerBlock>>) -> Self {
+        let footprint = slots.iter().map(|s| s.memory_footprint()).sum();
+        Self {
+            slots: slots.into_boxed_slice(),
+            footprint,
+        }
+    }
 }
 
 // ============================================================================
@@ -263,6 +303,9 @@ unsafe impl Sync for LayerBlock {}
 // StorageEngine
 // ============================================================================
 
+/// Notification sent when a block is sealed (for SSD offload, etc.)
+pub type SealNotification = (BlockKey, Weak<SealedBlock>);
+
 pub struct StorageEngine {
     /// Pinned memory allocator
     pinned_pool: Arc<PinnedMemoryPool>,
@@ -270,31 +313,45 @@ pub struct StorageEngine {
     /// Write path: blocks being filled (not yet sealed)
     inflight: DashMap<BlockKey, Mutex<InflightBlock>>,
 
-    /// Read path: sealed blocks available for lookup
-    cache: Arc<Mutex<LruCache<BlockKey, Arc<SealedBlock>>>>,
+    /// Read path: sealed blocks available for lookup (TinyLFU admission + LRU eviction)
+    cache: Arc<Mutex<TinyLfuCache<BlockKey, Arc<SealedBlock>>>>,
 
     /// Pre-eviction control
     pre_evict_stop: Arc<AtomicBool>,
     pre_evict_handle: Option<JoinHandle<()>>,
+
+    /// Channel to notify consumers when blocks are sealed (for SSD offload)
+    seal_notify_tx: Option<UnboundedSender<SealNotification>>,
 }
 
 impl StorageEngine {
+    /// Create a new StorageEngine with optional seal notification channel.
+    /// Returns (engine, receiver) where receiver gets notified of sealed blocks.
     pub fn new_with_config(
         capacity_bytes: usize,
         use_hugepages: bool,
-        config: PreEvictConfig,
-    ) -> Self {
+        config: impl Into<StorageConfig>,
+    ) -> (Self, UnboundedReceiver<SealNotification>) {
+        let config = config.into();
         let pinned_pool = Arc::new(PinnedMemoryPool::new(capacity_bytes, use_hugepages));
-        let cache = Arc::new(Mutex::new(LruCache::new_unbounded()));
+        let cache = Arc::new(Mutex::new(TinyLfuCache::new_unbounded(
+            capacity_bytes,
+            config.enable_lfu_admission,
+        )));
         let inflight = DashMap::new();
         let pre_evict_stop = Arc::new(AtomicBool::new(false));
 
-        let pre_evict_handle = if config.enabled {
+        // Create unbounded channel for seal notifications
+        let (seal_notify_tx, seal_notify_rx) = mpsc::unbounded_channel();
+
+        let pre_evict_config = config.pre_evict_config.clone();
+
+        let pre_evict_handle = if pre_evict_config.enabled {
             info!(
                 "Starting pre-eviction monitor: threshold={}, target={}, interval={}ms",
-                ByteSize(config.threshold_bytes),
-                ByteSize(config.target_bytes),
-                config.check_interval_ms
+                ByteSize(pre_evict_config.threshold_bytes),
+                ByteSize(pre_evict_config.target_bytes),
+                pre_evict_config.check_interval_ms
             );
 
             let pool = Arc::clone(&pinned_pool);
@@ -302,19 +359,23 @@ impl StorageEngine {
             let stop = Arc::clone(&pre_evict_stop);
 
             Some(std::thread::spawn(move || {
-                Self::pre_evict_monitor(pool, cache_clone, config, stop);
+                Self::pre_evict_monitor(pool, cache_clone, pre_evict_config, stop);
             }))
         } else {
             None
         };
 
-        Self {
-            pinned_pool,
-            inflight,
-            cache,
-            pre_evict_stop,
-            pre_evict_handle,
-        }
+        (
+            Self {
+                pinned_pool,
+                inflight,
+                cache,
+                pre_evict_stop,
+                pre_evict_handle,
+                seal_notify_tx: Some(seal_notify_tx),
+            },
+            seal_notify_rx,
+        )
     }
 
     // ========================================================================
@@ -408,9 +469,17 @@ impl StorageEngine {
                 let inflight_block = mutex.into_inner().unwrap();
                 let sealed = Arc::new(inflight_block.seal());
 
+                // Notify SSD offload consumer (fire-and-forget)
+                if let Some(tx) = &self.seal_notify_tx {
+                    let _ = tx.send((key.clone(), Arc::downgrade(&sealed)));
+                }
+
                 let mut cache = self.cache.lock().unwrap();
-                cache.insert(key, sealed);
-                core_metrics().cache_block_insertions.add(1, &[]);
+                if cache.insert(key, sealed) {
+                    core_metrics().cache_block_insertions.add(1, &[]);
+                } else {
+                    core_metrics().cache_block_admission_rejections.add(1, &[]);
+                }
             }
         }
 
@@ -439,7 +508,7 @@ impl StorageEngine {
         let mut result = Vec::with_capacity(block_hashes.len());
         for (idx, hash) in block_hashes.iter().enumerate() {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            let block = cache.get(&key).cloned().ok_or_else(|| {
+            let block = cache.get(&key).ok_or_else(|| {
                 format!(
                     "missing KV block hash at index {idx} (namespace={namespace}, hash_len={})",
                     hash.len()
@@ -448,6 +517,18 @@ impl StorageEngine {
             result.push(block);
         }
         Ok(result)
+    }
+
+    /// Insert a pre-built SealedBlock directly into the cache.
+    /// Used by prefetch to insert blocks loaded from DFS.
+    pub fn cache_insert(&self, namespace: &str, block_hash: Vec<u8>, block: Arc<SealedBlock>) {
+        let key = BlockKey::new(namespace.to_string(), block_hash);
+        let mut cache = self.cache.lock().unwrap();
+        if cache.insert(key, block) {
+            core_metrics().cache_block_insertions.add(1, &[]);
+        } else {
+            core_metrics().cache_block_admission_rejections.add(1, &[]);
+        }
     }
 
     // ========================================================================
@@ -485,7 +566,7 @@ impl StorageEngine {
     }
 
     fn reclaim_from_cache_by_bytes(
-        cache: &Arc<Mutex<LruCache<BlockKey, Arc<SealedBlock>>>>,
+        cache: &Arc<Mutex<TinyLfuCache<BlockKey, Arc<SealedBlock>>>>,
         target_bytes: u64,
     ) -> (usize, u64) {
         if target_bytes == 0 {
@@ -522,7 +603,7 @@ impl StorageEngine {
 
     fn pre_evict_monitor(
         pool: Arc<PinnedMemoryPool>,
-        cache: Arc<Mutex<LruCache<BlockKey, Arc<SealedBlock>>>>,
+        cache: Arc<Mutex<TinyLfuCache<BlockKey, Arc<SealedBlock>>>>,
         config: PreEvictConfig,
         stop: Arc<AtomicBool>,
     ) {

@@ -74,6 +74,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 100)]
     pub pre_evict_interval_ms: u64,
 
+    /// Disable TinyLFU admission (falls back to plain LRU inserts)
+    #[arg(long, default_value_t = false)]
+    pub disable_lfu_admission: bool,
+
     /// Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317). Leave empty to disable.
     #[arg(long, default_value = "http://127.0.0.1:4321")]
     pub metrics_otel_endpoint: Option<String>,
@@ -85,6 +89,22 @@ pub struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     pub log_level: String,
+
+    /// Redis URL for seal offload. If set, sealed blocks' keys are written to Redis.
+    #[arg(long)]
+    pub redis_url: Option<String>,
+
+    /// DFS root directory for block offload (e.g., /mnt/dfs/pega)
+    #[arg(long, default_value = "/tmp/pega")]
+    pub dfs_root: String,
+
+    /// DFS quota in bytes (triggers eviction when exceeded)
+    #[arg(long, default_value = "50gb", value_parser = parse_memory_size)]
+    pub dfs_quota: usize,
+
+    /// DFS quota scan interval in milliseconds
+    #[arg(long, default_value_t = 100)]
+    pub dfs_scan_interval_ms: u64,
 }
 
 fn init_tracing(log_level: &str) {
@@ -204,14 +224,19 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pegaflow_core::PreEvictConfig::default()
     };
 
-    let engine = Arc::new(PegaEngine::new_with_config(
-        cli.pool_size,
-        cli.use_hugepages,
+    let storage_config = pegaflow_core::StorageConfig {
         pre_evict_config,
-    ));
-    let shutdown = Arc::new(Notify::new());
+        enable_lfu_admission: !cli.disable_lfu_admission,
+    };
 
-    let service = GrpcEngineService::new(engine, Arc::clone(&registry), Arc::clone(&shutdown));
+    if cli.disable_lfu_admission {
+        info!("TinyLFU cache admission disabled; falling back to plain LRU inserts");
+    }
+
+    let (engine, seal_notify_rx) =
+        PegaEngine::new_with_config(cli.pool_size, cli.use_hugepages, storage_config);
+    let engine = Arc::new(engine);
+    let shutdown = Arc::new(Notify::new());
 
     // Now create and start Tokio runtime after CUDA initialization
     // Using multi-thread runtime since GPU operations now run in dedicated worker threads
@@ -223,6 +248,45 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let metrics_period = cli.metrics_period_secs;
 
     runtime.block_on(async move {
+        // Create service - with or without DFS support depending on redis config
+        let service = if let Some(url) = &cli.redis_url {
+            // Spawn the DFS offload task
+            let config = pegaflow_core::DfsOffloadConfig {
+                dfs_root: cli.dfs_root.clone().into(),
+                quota_bytes: cli.dfs_quota as u64,
+                scan_interval_ms: cli.dfs_scan_interval_ms,
+                ..Default::default()
+            };
+            let _offload_handles =
+                pegaflow_core::spawn_dfs_offload_task(seal_notify_rx, url, config).await?;
+
+            // Create Redis connection for query prefetch
+            let redis_client = redis::Client::open(url.as_str()).map_err(|e| {
+                std::io::Error::other(format!("Failed to create Redis client: {e}"))
+            })?;
+            let redis_conn = redis_client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|e| std::io::Error::other(format!("Failed to connect to Redis: {e}")))?;
+
+            info!("DFS prefetch enabled with Redis at {}", url);
+            GrpcEngineService::with_dfs(
+                Arc::clone(&engine),
+                Arc::clone(&registry),
+                Arc::clone(&shutdown),
+                redis_conn,
+                cli.dfs_root.into(),
+            )
+        } else {
+            // Drop the receiver since we're not using DFS offload
+            drop(seal_notify_rx);
+            GrpcEngineService::new(
+                Arc::clone(&engine),
+                Arc::clone(&registry),
+                Arc::clone(&shutdown),
+            )
+        };
+
         // Initialize OTEL metrics (requires Tokio runtime for gRPC)
         let meter_provider = init_metrics(metrics_endpoint, metrics_period)?;
 

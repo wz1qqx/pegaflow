@@ -1,14 +1,21 @@
 pub mod allocator;
+mod cache;
 pub mod gpu_worker;
 mod metrics;
 pub mod pinned_mem;
 pub mod pinned_pool;
+mod seal_offload;
 mod storage;
 pub mod sync_state;
 mod transfer;
 
 pub use pinned_pool::PinnedAllocation;
-pub use storage::PreEvictConfig;
+pub use seal_offload::{
+    batch_get_block_meta, get_block_meta, prefetch_blocks_from_dfs, spawn_dfs_offload_task,
+    spawn_seal_offload_task, BlockMeta, DfsOffloadConfig, PrefetchStatus, PrefetchTracker,
+    SlotMeta,
+};
+pub use storage::{PreEvictConfig, SealNotification, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 
 // ============================================================================
@@ -87,7 +94,7 @@ pub struct PegaEngine {
     /// Manages instances and their GPU contexts
     instances: RwLock<HashMap<String, Arc<InstanceContext>>>,
     /// Storage engine responsible for pinned allocations + block cache
-    storage: StorageEngine,
+    storage: Arc<StorageEngine>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,29 +270,41 @@ impl PegaEngine {
     /// Create a new PegaEngine instance with default pool size and regular pages
     #[instrument(level = "info")]
     pub fn new() -> Self {
-        Self::new_with_pool_size(DEFAULT_PINNED_POOL_BYTES, false)
+        let (engine, _rx) = Self::new_with_config(
+            DEFAULT_PINNED_POOL_BYTES,
+            false,
+            storage::StorageConfig::default(),
+        );
+        engine
     }
 
     /// Create a new PegaEngine instance with a custom pinned memory pool size
     ///
     /// If `use_hugepages` is true, uses 2MB huge pages (requires system config).
     pub fn new_with_pool_size(pool_size: usize, use_hugepages: bool) -> Self {
-        Self::new_with_config(pool_size, use_hugepages, storage::PreEvictConfig::default())
+        let (engine, _rx) =
+            Self::new_with_config(pool_size, use_hugepages, storage::StorageConfig::default());
+        engine
     }
 
-    /// Create a new PegaEngine instance with custom pool size and pre-eviction config
+    /// Create a new PegaEngine instance with custom pool size and storage config
     ///
     /// If `use_hugepages` is true, uses 2MB huge pages (requires system config).
+    /// Returns (engine, seal_notify_rx) - pass receiver to `spawn_seal_offload_task` for SSD offload.
     pub fn new_with_config(
         pool_size: usize,
         use_hugepages: bool,
-        pre_evict_config: storage::PreEvictConfig,
-    ) -> Self {
-        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, pre_evict_config);
-        PegaEngine {
-            instances: RwLock::new(HashMap::new()),
-            storage,
-        }
+        storage_config: impl Into<storage::StorageConfig>,
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<SealNotification>) {
+        let (storage, seal_notify_rx) =
+            StorageEngine::new_with_config(pool_size, use_hugepages, storage_config);
+        (
+            PegaEngine {
+                instances: RwLock::new(HashMap::new()),
+                storage: Arc::new(storage),
+            },
+            seal_notify_rx,
+        )
     }
 
     fn get_or_create_instance(
@@ -816,6 +835,109 @@ impl PegaEngine {
         );
 
         Ok(hit_count)
+    }
+
+    /// Count prefix hit blocks with async DFS prefetch support.
+    ///
+    /// Returns:
+    /// - `Ready(n)`: n blocks are in local cache, ready for immediate load
+    /// - `Prefetching { ready, loading }`: ready blocks in cache, loading blocks being fetched
+    /// - `PartialMiss { ready, missing }`: some blocks don't exist in DFS either
+    ///
+    /// When a cache miss is detected but Redis has metadata, this method automatically
+    /// starts a background prefetch from DFS. The caller should retry after a short delay.
+    #[instrument(
+        level = "debug",
+        skip(self, block_hashes, redis_conn, tracker),
+        err,
+        fields(instance=%instance_id, requested = %block_hashes.len())
+    )]
+    pub async fn count_prefix_hit_blocks_async(
+        &self,
+        instance_id: &str,
+        block_hashes: &[Vec<u8>],
+        redis_conn: &mut redis::aio::MultiplexedConnection,
+        tracker: &Arc<seal_offload::PrefetchTracker>,
+        dfs_root: &std::path::Path,
+    ) -> Result<seal_offload::PrefetchStatus, EngineError> {
+        use seal_offload::{batch_get_block_meta, prefetch_blocks_from_dfs, PrefetchStatus};
+
+        let instance = self.get_instance(instance_id)?;
+        let namespace = &instance.namespace;
+
+        let mut ready = 0usize;
+        let mut loading = 0usize;
+        let mut first_miss_idx = None;
+
+        // Count local cache hits and check pending prefetches
+        for (idx, block_hash) in block_hashes.iter().enumerate() {
+            if self.storage.cache_contains(namespace, block_hash) {
+                ready += 1;
+            } else if tracker.is_pending(namespace, block_hash) {
+                loading += 1;
+            } else {
+                // First block not in cache and not pending
+                first_miss_idx = Some(idx);
+                break;
+            }
+        }
+
+        // If all blocks are in cache or loading, return current status
+        if first_miss_idx.is_none() {
+            if loading > 0 {
+                return Ok(PrefetchStatus::Prefetching { ready, loading });
+            } else {
+                return Ok(PrefetchStatus::Ready(ready));
+            }
+        }
+
+        let miss_idx = first_miss_idx.unwrap();
+
+        // Check if prefetch is at capacity
+        if tracker.available_permits() == 0 {
+            debug!("Prefetch at capacity, treating as partial miss");
+            return Ok(PrefetchStatus::PartialMiss {
+                ready,
+                missing: block_hashes.len() - ready - loading,
+            });
+        }
+
+        // Query Redis for the first missing block to check if it exists in DFS
+        let miss_hashes = vec![block_hashes[miss_idx].clone()];
+        let metas = batch_get_block_meta(redis_conn, namespace, &miss_hashes)
+            .await
+            .map_err(|e| EngineError::Storage(format!("Redis query failed: {}", e)))?;
+
+        if metas[0].is_none() {
+            // Block doesn't exist in DFS either
+            debug!(
+                miss_idx,
+                "Block not found in Redis, treating as partial miss"
+            );
+            return Ok(PrefetchStatus::PartialMiss {
+                ready: ready + loading,
+                missing: block_hashes.len() - ready - loading,
+            });
+        }
+
+        // Block exists in Redis, start prefetch for remaining blocks
+        let to_prefetch: Vec<Vec<u8>> = block_hashes[miss_idx..].to_vec();
+        let prefetch_count = to_prefetch.len();
+
+        // Spawn prefetch task (fire and forget)
+        prefetch_blocks_from_dfs(
+            Arc::clone(&self.storage),
+            redis_conn.clone(),
+            Arc::clone(tracker),
+            dfs_root.to_path_buf(),
+            namespace.to_string(),
+            to_prefetch,
+        );
+
+        Ok(PrefetchStatus::Prefetching {
+            ready,
+            loading: loading + prefetch_count,
+        })
     }
 
     /// Batch load KV blocks for multiple layers asynchronously.
