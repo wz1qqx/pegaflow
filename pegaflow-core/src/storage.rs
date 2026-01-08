@@ -37,6 +37,9 @@ use crate::ssd_cache::{
 /// Number of LRU blocks to evict per iteration when reclaiming memory
 const RECLAIM_BATCH_SIZE: usize = 64;
 
+/// SSD I/O alignment requirement (O_DIRECT requires 512-byte aligned I/O)
+pub const SSD_ALIGNMENT: usize = 512;
+
 /// Configuration for cache + storage behavior.
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
@@ -185,6 +188,7 @@ impl StorageEngine {
     /// Initialize SSD cache state (file + io_uring + channels, no workers yet)
     fn init_ssd_state(config: SsdCacheConfig) -> std::io::Result<(SsdState, SsdReceivers)> {
         use std::fs::{self, OpenOptions};
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
 
         if let Some(parent) = config.cache_path.parent() {
@@ -196,6 +200,7 @@ impl StorageEngine {
             .truncate(true)
             .read(true)
             .write(true)
+            .custom_flags(libc::O_DIRECT)
             .open(&config.cache_path)?;
         file.set_len(config.capacity_bytes)?;
 
@@ -306,6 +311,11 @@ impl StorageEngine {
         )))
     }
 
+    /// Returns true if SSD cache is enabled.
+    pub fn is_ssd_enabled(&self) -> bool {
+        self.ssd_state.is_some()
+    }
+
     // ========================================================================
     // Allocation
     // ========================================================================
@@ -359,9 +369,13 @@ impl StorageEngine {
     /// - Skip if already in cache (sealed)
     /// - Skip if slot already exists in inflight
     /// - Create inflight block if needed
-    /// - Auto-seal and migrate to cache when complete
+    /// - Seal when complete (but does NOT auto-admit to cache)
     ///
-    /// Returns Ok(true) if the slot was actually inserted, Ok(false) if skipped.
+    /// Returns:
+    /// - `Ok(None)` if slot was skipped (already exists) or block not yet complete
+    /// - `Ok(Some((key, block)))` if block just completed and was sealed
+    ///
+    /// Caller is responsible for calling `cache_admit` to insert into cache.
     pub fn insert_slot(
         &self,
         namespace: &str,
@@ -369,14 +383,14 @@ impl StorageEngine {
         slot_id: usize,
         block: Arc<LayerBlock>,
         total_slots: usize,
-    ) -> Result<bool, BlockInsertError> {
+    ) -> Result<Option<(BlockKey, Arc<SealedBlock>)>, BlockInsertError> {
         let key = BlockKey::new(namespace.to_string(), block_hash);
 
         let mut inner = self.inner.lock().unwrap();
 
         // Fast path: already sealed in cache
         if inner.cache.contains_key(&key) {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Get or create inflight block
@@ -387,7 +401,7 @@ impl StorageEngine {
 
         // Check if slot already exists
         if inflight_block.slot_exists(slot_id) {
-            return Ok(false);
+            return Ok(None);
         }
 
         let completed = inflight_block.insert_slot(slot_id, block, total_slots)?;
@@ -397,8 +411,7 @@ impl StorageEngine {
             let inflight_block = inner.inflight.remove(&key).expect("just checked");
             let sealed = Arc::new(inflight_block.seal());
 
-            // Send to SSD writer (if configured) - do this before releasing lock
-            // to avoid the block being evicted before it's written
+            // Send to SSD writer (if configured)
             if let Some(ref ssd_state) = self.ssd_state {
                 let _ = ssd_state.writer_tx.send(SsdWriteRequest {
                     key: key.clone(),
@@ -406,21 +419,29 @@ impl StorageEngine {
                 });
             }
 
-            // Insert into cache
-            if inner.cache.insert(key.clone(), sealed.clone()) {
-                core_metrics().cache_block_insertions.add(1, &[]);
-            } else {
-                core_metrics().cache_block_admission_rejections.add(1, &[]);
-            }
-
             // Notify external consumers (fire-and-forget)
             drop(inner); // Release lock before sending to channel
             if let Some(tx) = &self.seal_notify_tx {
-                let _ = tx.send((key, Arc::downgrade(&sealed)));
+                let _ = tx.send((key.clone(), Arc::downgrade(&sealed)));
             }
+
+            return Ok(Some((key, sealed)));
         }
 
-        Ok(true)
+        Ok(None)
+    }
+
+    /// Attempt to admit a sealed block into cache using TinyLFU policy.
+    /// Returns true if admitted, false if rejected.
+    pub fn cache_admit(&self, key: BlockKey, block: Arc<SealedBlock>) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.cache.insert(key, block) {
+            core_metrics().cache_block_insertions.add(1, &[]);
+            true
+        } else {
+            core_metrics().cache_block_admission_rejections.add(1, &[]);
+            false
+        }
     }
 
     // ========================================================================
