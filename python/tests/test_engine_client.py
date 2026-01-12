@@ -12,8 +12,6 @@ Run with:
     cd python && pytest tests/ -v
 """
 
-import pytest
-
 
 class TestEngineClientFixtures:
     """Test basic fixtures and server connectivity."""

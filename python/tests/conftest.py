@@ -5,6 +5,7 @@ and test helpers for connector testing against a running server.
 """
 
 import hashlib
+import logging
 import os
 import pickle
 import signal
@@ -14,10 +15,8 @@ import sys
 import sysconfig
 import time
 import uuid
+from collections.abc import Generator
 from pathlib import Path
-from typing import Generator
-
-import logging
 
 import pytest
 import torch
@@ -122,7 +121,7 @@ def initialize_kv_cache(
 ) -> list[torch.Tensor]:
     """
     Initialize KV cache tensors on GPU for testing.
-    
+
     Creates tensors in KV-first layout: (2, num_blocks, block_size, num_heads, head_size)
     where the first dimension is [K, V].
     """
@@ -143,7 +142,7 @@ def initialize_kv_cache(
 class ClientContext:
     """
     Client context that represents a vLLM instance.
-    
+
     This class abstracts a vLLM instance by managing:
     - GPU KV cache tensors (like WorkerConnector)
     - Query operations (like SchedulerConnector)
@@ -165,10 +164,10 @@ class ClientContext:
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
-        
+
         if device_id >= torch.cuda.device_count():
             raise ValueError(f"device_id {device_id} >= available GPUs ({torch.cuda.device_count()})")
-        
+
         self.engine_client = engine_client
         self.instance_id = instance_id
         self.namespace = namespace
@@ -185,7 +184,7 @@ class ClientContext:
         self.gpu_kv_caches = initialize_kv_cache(
             self.device, num_blocks, num_layers, block_size, num_heads, head_size, dtype
         )
-        
+
         # Map layer index to layer name (for compatibility with vLLM)
         self._layer_names = [f"layer_{i}" for i in range(num_layers)]
         self._layer_name_to_id = {name: i for i, name in enumerate(self._layer_names)}
@@ -195,12 +194,12 @@ class ClientContext:
         """Register KV cache tensors with the engine server (like WorkerConnector.register_kv_caches)."""
         if CudaIPCWrapper is None:
             raise RuntimeError("CudaIPCWrapper not available")
-        
+
         if self._registered:
             return
-        
+
         kv_caches = {name: self.gpu_kv_caches[i] for i, name in enumerate(self._layer_names)}
-        
+
         for layer_name, kv_cache in kv_caches.items():
             if not kv_cache.is_contiguous():
                 kv_cache = kv_cache.contiguous()
@@ -242,29 +241,29 @@ class ClientContext:
 
             if not ok:
                 raise RuntimeError(f"Register context failed for {layer_name}: {message}")
-        
+
         self._registered = True
 
     def unregister_context(self) -> None:
         """Unregister context from server (like WorkerConnector.unregister_context)."""
         if not self._registered:
             return
-        
+
         try:
             ok, message = self.engine_client.unregister_context(self.instance_id)
             if not ok:
                 logger.warning(f"Unregister context failed: {message}")
         except Exception as e:
             logger.warning(f"Unregister context exception: {e}")
-        
+
         self._registered = False
 
     def query(self, block_hashes: list[bytes]) -> dict | tuple:
         """Query available blocks (like SchedulerConnector._count_available_block_prefix).
-        
+
         Args:
             block_hashes: List of block hashes to query
-        
+
         Returns:
             Query result (dict or tuple format)
         """
@@ -331,11 +330,11 @@ class PegaServerProcess:
 
         env = os.environ.copy()
         env["PYO3_PYTHON"] = sys.executable
-        
+
         # Add libpython to LD_LIBRARY_PATH if available
         if libdir := sysconfig.get_config_var("LIBDIR"):
             env["LD_LIBRARY_PATH"] = f"{libdir}:{env.get('LD_LIBRARY_PATH', '')}"
-        
+
         # Set PYTHONPATH to include python package and venv site-packages
         python_dir = Path(__file__).parent.parent
         site_packages = next((p for p in sys.path if "site-packages" in p), None)
@@ -347,7 +346,7 @@ class PegaServerProcess:
             "--pool-size", self.pool_size,
             "--device", "0",
         ]
-        
+
         try:
             self.process = subprocess.Popen(
                 cmd,
@@ -392,10 +391,10 @@ def pega_server() -> Generator[PegaServerProcess, None, None]:
     """Session-scoped fixture that starts a PegaServer for integration tests."""
     port = find_available_port()
     server = PegaServerProcess(port=port)
-    
+
     if not server.start() or not server._binary_path:
         pytest.skip("PegaServer binary not found or failed to start")
-    
+
     yield server
     server.stop()
 
@@ -424,30 +423,30 @@ def client_context(
     engine_client, instance_id: str, namespace: str
 ) -> Generator[ClientContext, None, None]:
     """Fixture that provides a ClientContext representing a vLLM instance.
-    
+
     Args:
         engine_client: EngineRpcClient connected to server
         instance_id: Unique instance identifier
         namespace: Namespace for the instance
-    
+
     Returns:
         ClientContext instance (automatically registered)
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    
+
     ctx = ClientContext(
         engine_client=engine_client,
         instance_id=instance_id,
         namespace=namespace,
         device_id=0,
     )
-    
+
     # Auto-register on creation
     ctx.register_kv_caches()
-    
+
     yield ctx
-    
+
     # Cleanup
     ctx.unregister_context()
     del ctx.gpu_kv_caches
@@ -457,7 +456,7 @@ def client_context(
 @pytest.fixture
 def registered_instance(client_context: ClientContext) -> Generator[str, None, None]:
     """Fixture that returns the instance_id of a registered ClientContext.
-    
+
     The client_context fixture already handles registration/unregistration.
     This fixture just provides the instance_id for convenience.
     """
