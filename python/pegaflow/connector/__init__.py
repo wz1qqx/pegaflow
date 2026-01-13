@@ -16,7 +16,6 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
 from pegaflow.connector.common import (
     ConnectorContext,
-    ENGINE_ENDPOINT,
     PegaConnectorMetadata,
     RequestPhase,
     RequestTracker,
@@ -51,7 +50,18 @@ class PegaKVConnector(KVConnectorBase_V1):
             if torch.cuda.is_available():
                 device_id = _resolve_device_id()
 
-        self._engine_endpoint = ENGINE_ENDPOINT
+        assert vllm_config.kv_transfer_config is not None
+        server_host = os.environ.get(
+            "PEGAFLOW_HOST"
+        ) or vllm_config.kv_transfer_config.get_from_extra_config(
+            "pegaflow.host", "http://127.0.0.1"
+        )
+        server_port = os.environ.get(
+            "PEGAFLOW_PORT"
+        ) or vllm_config.kv_transfer_config.get_from_extra_config(
+            "pegaflow.port", 50055
+        )
+        self._engine_endpoint = f"{server_host}:{server_port}"
         engine_client = EngineRpcClient(self._engine_endpoint)
         logger.info(
             "[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint

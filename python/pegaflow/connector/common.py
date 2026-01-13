@@ -15,10 +15,6 @@ from pegaflow.pegaflow import EngineRpcClient
 
 logger = get_connector_logger()
 
-# Engine server endpoint (gRPC URL)
-ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT", "http://127.0.0.1:50055")
-
-
 @dataclass(frozen=True)
 class ConnectorContext:
     """Shared configuration for scheduler/worker connectors."""
@@ -304,7 +300,6 @@ def derive_namespace(vllm_config, tp_size: int) -> str:
 
 __all__ = [
     "ConnectorContext",
-    "ENGINE_ENDPOINT",
     "LoadIntent",
     "LoadState",
     "PegaConnectorMetadata",
