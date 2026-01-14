@@ -598,8 +598,14 @@ fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register custom exceptions for error classification
     m.add("PegaFlowError", m.py().get_type::<PegaFlowError>())?;
-    m.add("PegaFlowServiceError", m.py().get_type::<PegaFlowServiceError>())?;
-    m.add("PegaFlowBusinessError", m.py().get_type::<PegaFlowBusinessError>())?;
+    m.add(
+        "PegaFlowServiceError",
+        m.py().get_type::<PegaFlowServiceError>(),
+    )?;
+    m.add(
+        "PegaFlowBusinessError",
+        m.py().get_type::<PegaFlowBusinessError>(),
+    )?;
 
     Ok(())
 }
