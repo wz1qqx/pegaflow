@@ -219,18 +219,33 @@ class SchedulerConnector:
     def _count_available_block_prefix(
         self, block_hashes: Iterable[bytes], req_id: str
     ) -> int | None:
-        """Query available blocks with prefetch support.
+        """Query available blocks with prefetch support and fault tolerance.
 
         Returns:
             int: Number of blocks ready in cache (proceed with this)
             None: Blocks are being prefetched from DFS, retry later
+
+        Fault tolerance:
+            - If service unavailable, returns 0 (no cache hits)
+            - Any exception marks service unavailable and returns 0
         """
-        result = self._ctx.engine_client.query(self._ctx.instance_id, list(block_hashes))
+        # Check service availability first
+        if not self._ctx.state_manager.is_available():
+            return 0
+
+        try:
+            result = self._ctx.engine_client.query(self._ctx.instance_id, list(block_hashes))
+        except Exception as e:
+            # Any exception marks service unavailable
+            self._ctx.state_manager.mark_unavailable(str(e))
+            return 0
 
         # Handle new dict response format
         if isinstance(result, dict):
             if not result.get("ok", False):
-                raise RuntimeError(f"Query failed: {result.get('message', 'unknown error')}")
+                error_msg = result.get("message", "unknown error")
+                self._ctx.state_manager.mark_unavailable(error_msg)
+                return 0
 
             prefetch_state = result.get("prefetch_state", "done")
             hit_blocks = result.get("hit_blocks", 0)
@@ -257,8 +272,6 @@ class SchedulerConnector:
 
         # Legacy tuple response format (ok, message, hit_blocks)
         ok, message, hit_blocks = result
-        if not ok:
-            raise RuntimeError(f"Query failed: {message}")
         return hit_blocks
 
 
