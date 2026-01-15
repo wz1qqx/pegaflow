@@ -74,14 +74,12 @@ llm = LLM(
 ## vllm-patch
 
 ```bash
-
 # 自动检测 vllm 路径
 python -m pegaflow.patch_vllm
 
 # 指定 vllm 路径
 python -m pegaflow.patch_vllm /path/to/vllm
-
-```bash
+```
 
 ## Development
 
