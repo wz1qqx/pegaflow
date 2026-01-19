@@ -67,7 +67,7 @@ pub struct Cli {
     pub disable_lfu_admission: bool,
 
     /// Address for Prometheus metrics HTTP endpoint (e.g. 0.0.0.0:9091). Leave empty to disable.
-    #[arg(long)]
+    #[arg(long, default_value = "0.0.0.0:9091")]
     pub metrics_addr: Option<SocketAddr>,
 
     /// **DEPRECATED**: Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317).
@@ -265,9 +265,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     // Initialize OTEL metrics BEFORE creating PegaEngine, so that core metrics
     // (pool, cache, save/load) use the real meter provider instead of noop.
+    let metrics_addr = if cli.metrics_addr.is_empty() {
+        None
+    } else {
+        Some(cli.metrics_addr.parse()?)
+    };
     let metrics_state = runtime.block_on(async {
         init_metrics(
-            cli.metrics_addr.is_some(),
+            metrics_addr.is_some(),
             cli.metrics_otel_endpoint.clone(),
             cli.metrics_period_secs,
         )

@@ -19,7 +19,7 @@ PegaFlow Server → Prometheus → Grafana
 
 ### Method 2: OTLP via OpenTelemetry Collector (Deprecated)
 
-> **DEPRECATED**: This method is deprecated and will be removed in a future release.
+> **DEPRECATED**: This method is deprecated now, but we will keep it.
 > Please use Method 1 (Direct Prometheus) instead.
 
 ```
