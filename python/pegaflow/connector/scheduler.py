@@ -51,8 +51,14 @@ class SchedulerConnector:
         num_tokens = request.num_tokens
         block_hashes = request.block_hashes
 
+        computed_blocks = num_computed_tokens // self._ctx.block_size
+        remaining_hashes = block_hashes[computed_blocks:]
+
+        if not remaining_hashes:
+            return (0, False)
+
         lookup_start = time.perf_counter()
-        hit_blocks = self._count_available_block_prefix(block_hashes, req_id)
+        hit_blocks = self._count_available_block_prefix(remaining_hashes, req_id)
         lookup_end = time.perf_counter()
         elapsed_us = (lookup_end - lookup_start) * 1e6
 
@@ -60,8 +66,8 @@ class SchedulerConnector:
         if hit_blocks is None:
             return (None, False)
 
-        computed_blocks = num_computed_tokens // self._ctx.block_size
-        num_hit_tokens = hit_blocks * self._ctx.block_size - num_computed_tokens
+        # hit_blocks now represents hits in remaining (non-computed) blocks only
+        num_hit_tokens = hit_blocks * self._ctx.block_size
 
         logger.info(
             "[PegaKVConnector] req=%s cache_lookup: hit_blocks=%d computed_blocks=%d "
