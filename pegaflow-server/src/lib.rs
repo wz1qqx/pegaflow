@@ -63,7 +63,7 @@ pub struct Cli {
     pub use_hugepages: bool,
 
     /// Disable TinyLFU admission (falls back to plain LRU inserts)
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     pub disable_lfu_admission: bool,
 
     /// Address for Prometheus metrics HTTP endpoint (e.g. 0.0.0.0:9091). Leave empty to disable.
@@ -99,6 +99,18 @@ pub struct Cli {
     /// SSD prefetch queue depth (max pending prefetch batches). Default: 2
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_SSD_PREFETCH_QUEUE_DEPTH)]
     pub ssd_prefetch_queue_depth: usize,
+
+    /// SSD write inflight (max concurrent block writes). Default: 2
+    #[arg(long, default_value_t = pegaflow_core::DEFAULT_SSD_WRITE_INFLIGHT)]
+    pub ssd_write_inflight: usize,
+
+    /// SSD prefetch inflight (max concurrent block reads). Default: 16
+    #[arg(long, default_value_t = pegaflow_core::DEFAULT_SSD_PREFETCH_INFLIGHT)]
+    pub ssd_prefetch_inflight: usize,
+
+    /// Max blocks allowed in prefetching state (backpressure for SSD prefetch). Default: 1500
+    #[arg(long, default_value_t = 800)]
+    pub max_prefetch_blocks: usize,
 }
 
 fn format_py_err(err: PyErr) -> String {
@@ -234,23 +246,28 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let ssd_cache_config = cli.ssd_cache_path.as_ref().map(|path| {
         info!(
-            "SSD cache enabled: path={}, capacity={:.2} GiB, write_queue={}, prefetch_queue={}",
+            "SSD cache enabled: path={}, capacity={:.2} GiB, write_queue={}, prefetch_queue={}, write_inflight={}, prefetch_inflight={}",
             path,
             cli.ssd_cache_capacity as f64 / (1024.0 * 1024.0 * 1024.0),
             cli.ssd_write_queue_depth,
             cli.ssd_prefetch_queue_depth,
+            cli.ssd_write_inflight,
+            cli.ssd_prefetch_inflight,
         );
         pegaflow_core::SsdCacheConfig {
             cache_path: path.into(),
             capacity_bytes: cli.ssd_cache_capacity as u64,
             write_queue_depth: cli.ssd_write_queue_depth,
             prefetch_queue_depth: cli.ssd_prefetch_queue_depth,
+            write_inflight: cli.ssd_write_inflight,
+            prefetch_inflight: cli.ssd_prefetch_inflight,
         }
     });
 
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: !cli.disable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
+        max_prefetch_blocks: cli.max_prefetch_blocks,
         ssd_cache_config,
     };
 
