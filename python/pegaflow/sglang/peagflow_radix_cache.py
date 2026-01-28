@@ -4,6 +4,8 @@ import hashlib
 import logging
 import os
 import pickle
+import queue
+import threading
 import time
 import uuid
 import weakref
@@ -144,9 +146,6 @@ class PeagflowRadixCache(RadixCache):
 
         self._register_kv_caches()
 
-        self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
-
         # Cleanup on GC or interpreter shutdown (handles Ctrl+C gracefully)
         self._finalizer = weakref.finalize(
             self,
@@ -155,6 +154,14 @@ class PeagflowRadixCache(RadixCache):
             self.engine_client,
             self.tp_rank,
         )
+
+        self.save_tasks = queue.Queue()
+        self._evict_lock = threading.Lock()  # Held during evict to block new saves
+        self._shutdown = threading.Event()
+        self.save_thread = threading.Thread(
+            target=self._save_worker, daemon=True, name="PegaSaveWorker"
+        )
+        self.save_thread.start()
 
     # --------------------------------------------------------------------- #
     # Helpers
@@ -556,7 +563,7 @@ class PeagflowRadixCache(RadixCache):
             block_ids.append(int(kv_indices[i].item()) // block_size)
 
         # Ensure GPU writes are done before save
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
 
         saves = list(
             zip(
@@ -571,25 +578,80 @@ class PeagflowRadixCache(RadixCache):
             f"[PeagflowRadixCache] save req={getattr(req, 'request_id', None)} blocks={len(block_ids)} layers={len(saves)}"
         )
 
-        try:
-            ok, message = self.engine_client.save(
-                self.instance_id,
-                0 if self.is_mla else self.tp_rank,
-                self.device_id,
-                saves,
-            )
-            if not ok:
-                logger.warning(f"[PeagflowRadixCache] save failed: {message}")
-        except Exception as e:
-            logger.warning(f"[PeagflowRadixCache] save exception: {e}")
+        self._save_async(saves)
+
+    def _save_async(self, saves):
+        with self._evict_lock:
+            self.save_tasks.put(saves)
+
+    def _save_worker(self):
+        while not self._shutdown.is_set():
+            try:
+                # Get first item with timeout to check shutdown flag
+                try:
+                    saves = self.save_tasks.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                task_count = 1
+
+                # Drain all pending items from queue
+                while True:
+                    try:
+                        more_saves = self.save_tasks.get_nowait()
+                        saves.extend(more_saves)
+                        task_count += 1
+                    except queue.Empty:
+                        break
+
+                try:
+                    ok, message = self.engine_client.save(
+                        self.instance_id,
+                        0 if self.is_mla else self.tp_rank,
+                        self.device_id,
+                        saves,
+                    )
+                    if not ok:
+                        logger.warning("[PeagflowRadixCache] save failed: %s", message)
+                except Exception as e:
+                    logger.warning("[PeagflowRadixCache] save exception: %s", e)
+                finally:
+                    # Mark all tasks as done
+                    for _ in range(task_count):
+                        self.save_tasks.task_done()
+            except Exception as e:
+                logger.warning("[PeagflowRadixCache] save worker exception: %s", e)
+
+    def join_save_task(self) -> None:
+        """
+        Wait for all pending save tasks to complete.
+        same as Queue.join()
+        """
+        start = time.monotonic()
+        warned = False
+        while True:
+            with self.save_tasks.all_tasks_done:
+                if self.save_tasks.unfinished_tasks == 0:
+                    break
+                self.save_tasks.all_tasks_done.wait(timeout=0.1)
+            if not warned and (time.monotonic() - start) > 2:
+                logger.warning(
+                    "[PeagflowRadixCache] waiting >2s for save tasks to finish",
+                )
+                warned = True
 
     def evict(self, num_tokens: int) -> None:  # type: ignore[override]
         if self.disable:
             return
-        self.store_stream.synchronize()
-        super().evict(num_tokens)
+        with self._evict_lock:
+            self.join_save_task()
+            super().evict(num_tokens)
 
-    def unregister_context(self) -> None:
+    def shutdown(self) -> None:
+        """Gracefully shutdown the save worker and unregister context."""
+        self.join_save_task()
+        self._shutdown.set()
+        if self.save_thread.is_alive():
+            self.save_thread.join(timeout=2.0)
         PeagflowRadixCache._unregister_context(self.instance_id, self.engine_client, self.tp_rank)
 
 
