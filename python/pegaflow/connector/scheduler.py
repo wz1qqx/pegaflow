@@ -4,6 +4,7 @@ Scheduler-side connector logic.
 
 import os
 import time
+from collections import deque
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -36,14 +37,137 @@ def _parse_env_int(name: str, default: int) -> int:
         return default
 
 
+def _parse_env_float(name: str, default: float) -> float:
+    """Parse a float from environment variable with fallback to default."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("Invalid %s value '%s', using default %f", name, value, default)
+        return default
+
+
+class SSDLoadTracker:
+    """Track SSD load and control bypass decisions.
+
+    This class centralizes all SSD-related flow control logic:
+    - Tracks pending prefetch count (requests waiting for SSD)
+    - Records prefetch latency history
+    - Determines bypass threshold based on load level
+    - Provides should_bypass() for flow control decisions
+
+    High load condition (both must be true):
+    - avg_latency > HIGH_LOAD_LATENCY_THRESHOLD (default 200ms)
+    - pending_prefetches > HIGH_LOAD_QUEUE_DEPTH (default 5)
+
+    The bypass threshold and load level are updated when get_stats() is called
+    (typically by Prometheus scraping), ensuring consistent decisions between
+    metrics collection intervals.
+    """
+
+    # Configurable via environment variables
+    HIGH_LOAD_LATENCY_THRESHOLD: float = _parse_env_float("PEGA_SSD_HIGH_LOAD_LATENCY_MS", 200.0)
+    HIGH_LOAD_QUEUE_DEPTH: int = _parse_env_int("PEGA_SSD_HIGH_LOAD_QUEUE_DEPTH", 5)
+    HIGH_LOAD_BYPASS_BLOCKS: int = _parse_env_int("PEGA_SSD_HIGH_LOAD_BYPASS_BLOCKS", 12)
+    LOW_LOAD_BYPASS_BLOCKS: int = _parse_env_int("PEGA_SSD_LOW_LOAD_BYPASS_BLOCKS", 8)
+
+    def __init__(self, window_size: int = 20):
+        # Prefetch latency history
+        self._latencies: deque[float] = deque(maxlen=window_size)
+        self._blocks: deque[int] = deque(maxlen=window_size)
+
+        # Current pending prefetch count (managed externally)
+        self._pending_prefetches: int = 0
+
+        # Cached state (updated in get_stats)
+        self._is_high_load: bool = False
+        self._bypass_threshold: int = self.LOW_LOAD_BYPASS_BLOCKS
+        self._avg_latency_ms: float = 0.0
+
+    def on_prefetch_start(self) -> None:
+        """Called when a request enters prefetch loading state."""
+        self._pending_prefetches += 1
+
+    def on_prefetch_complete(self, duration_ms: float, hit_blocks: int) -> None:
+        """Called when a request's prefetch completes.
+
+        Args:
+            duration_ms: Time spent waiting for prefetch in milliseconds.
+            hit_blocks: Number of blocks that were prefetched.
+        """
+        self._pending_prefetches = max(0, self._pending_prefetches - 1)
+        self._latencies.append(duration_ms)
+        self._blocks.append(hit_blocks)
+
+    def should_bypass(self, remaining_blocks: int) -> bool:
+        """Check if request should bypass cache lookup based on current load.
+
+        Uses the cached bypass threshold which is updated periodically by get_stats().
+
+        Args:
+            remaining_blocks: Number of blocks the request needs to load.
+
+        Returns:
+            True if the request should skip remote cache lookup.
+        """
+        return remaining_blocks < self._bypass_threshold
+
+    @property
+    def pending_prefetches(self) -> int:
+        """Current number of requests waiting for prefetch."""
+        return self._pending_prefetches
+
+    @property
+    def is_high_load(self) -> bool:
+        """Whether SSD is currently in high load state."""
+        return self._is_high_load
+
+    @property
+    def bypass_threshold(self) -> int:
+        """Current bypass threshold in blocks."""
+        return self._bypass_threshold
+
+    def get_stats(self) -> dict:
+        """Get stats and update internal state for bypass decisions.
+
+        This method should be called periodically (e.g., by Prometheus scraping).
+        It updates the cached load level and bypass threshold used by should_bypass().
+
+        Returns:
+            Dictionary with current metrics for logging/Prometheus.
+        """
+        # Calculate average latency
+        if self._latencies:
+            self._avg_latency_ms = sum(self._latencies) / len(self._latencies)
+        else:
+            self._avg_latency_ms = 0.0
+
+        # Update high load判定
+        self._is_high_load = (
+            self._avg_latency_ms > self.HIGH_LOAD_LATENCY_THRESHOLD
+            and self._pending_prefetches > self.HIGH_LOAD_QUEUE_DEPTH
+        )
+
+        # Update bypass threshold
+        self._bypass_threshold = (
+            self.HIGH_LOAD_BYPASS_BLOCKS if self._is_high_load else self.LOW_LOAD_BYPASS_BLOCKS
+        )
+
+        return {"pending_prefetches": self._pending_prefetches}
+
+    def get_prefetch_stats(self) -> tuple[list[float], list[int]]:
+        """Return raw prefetch data for Prometheus histogram.
+
+        Returns:
+            Tuple of (latencies_ms, block_counts) lists.
+        """
+        return list(self._latencies), list(self._blocks)
+
+
 class SchedulerConnector:
     """Holds scheduler-only state and behaviors."""
-
-    # Recompute bypass thresholds (configurable via environment variables)
-    # When pending loads >= this, consider bypass for short requests
-    BYPASS_PENDING_LOAD_THRESHOLD: int = _parse_env_int("PEGA_BYPASS_PENDING_LOAD_THRESHOLD", 4)
-    # Requests with remaining blocks <= this are considered "short"
-    BYPASS_SHORT_REQUEST_BLOCKS: int = _parse_env_int("PEGA_BYPASS_SHORT_REQUEST_BLOCKS", 8)
 
     def __init__(self, context: ConnectorContext):
         self._ctx = context
@@ -52,8 +176,11 @@ class SchedulerConnector:
         self._pending_load_intents: dict[str, LoadIntent] = {}
         self._prefetch_start_times: dict[str, float] = {}
 
-        # Fallback statistics
-        self._fallback_count: int = 0
+        # SSD load tracking and flow control (centralized in SSDLoadTracker)
+        self._ssd_tracker = SSDLoadTracker()
+
+        # Bypass statistics
+        self._bypass_count: int = 0
 
         # Save state (per-request)
         self._block_hashes: dict[str, tuple[bytes, ...]] = {}
@@ -80,23 +207,21 @@ class SchedulerConnector:
         if not remaining_hashes:
             return (0, False)
 
-        # Recompute fallback: when many requests are waiting for remote KV,
-        # let short requests bypass cache lookup and compute locally to
-        # improve GPU utilization.
+        # Check if request should bypass remote cache lookup
+        # SSDLoadTracker uses cached threshold (updated by Prometheus scraping)
         num_remaining_blocks = len(remaining_hashes)
-        num_pending_loads = len(self._pending_load_intents)
-        if (
-            num_pending_loads >= self.BYPASS_PENDING_LOAD_THRESHOLD
-            and num_remaining_blocks <= self.BYPASS_SHORT_REQUEST_BLOCKS
-        ):
-            self._fallback_count += 1
+        if self._ssd_tracker.should_bypass(num_remaining_blocks):
+            self._bypass_count += 1
             logger.info(
-                "[PegaKVConnector] req=%s recompute_fallback: "
-                "pending_loads=%d remaining_blocks=%d fallback_total=%d",
+                "[PegaKVConnector] req=%s recompute_bypass: "
+                "remaining_blocks=%d bypass_threshold=%d "
+                "pending_prefetches=%d ssd_load=%s bypass_total=%d",
                 req_id,
-                num_pending_loads,
                 num_remaining_blocks,
-                self._fallback_count,
+                self._ssd_tracker.bypass_threshold,
+                self._ssd_tracker.pending_prefetches,
+                "high" if self._ssd_tracker.is_high_load else "low",
+                self._bypass_count,
             )
             return (0, False)
 
@@ -154,11 +279,13 @@ class SchedulerConnector:
             )
             self._pending_load_intents[req_id] = load_intent
             logger.info(
-                "[PegaKVConnector] req=%s alloc: total_blocks=%d load_blocks=%d load_tokens=%d",
+                "[PegaKVConnector] req=%s alloc: total_blocks=%d load_blocks=%d "
+                "load_tokens=%d pending_loads=%d",
                 req_id,
                 len(block_ids),
                 len(load_intent.block_ids),
                 load_intent.num_tokens,
+                len(self._pending_load_intents),
             )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
@@ -330,6 +457,12 @@ class SchedulerConnector:
                 # Record first time we see loading state
                 if req_id not in self._prefetch_start_times:
                     self._prefetch_start_times[req_id] = time.perf_counter()
+                    self._ssd_tracker.on_prefetch_start()
+                    logger.info(
+                        "[PegaKVConnector] Prefetch started: req=%s pending_prefetches=%d",
+                        req_id,
+                        self._ssd_tracker.pending_prefetches,
+                    )
                 return None  # Signal scheduler to retry later
 
             # Prefetch done - log duration if we were tracking
@@ -337,11 +470,15 @@ class SchedulerConnector:
                 prefetch_duration_ms = (
                     time.perf_counter() - self._prefetch_start_times.pop(req_id)
                 ) * 1000
+                self._ssd_tracker.on_prefetch_complete(prefetch_duration_ms, hit_blocks)
+
                 logger.info(
-                    "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d prefetch_duration_ms=%.2f",
+                    "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d "
+                    "prefetch_duration_ms=%.2f pending_prefetches=%d",
                     req_id,
                     hit_blocks,
                     prefetch_duration_ms,
+                    self._ssd_tracker.pending_prefetches,
                 )
 
             return hit_blocks
@@ -351,22 +488,27 @@ class SchedulerConnector:
         return hit_blocks
 
     def get_stats(self) -> PegaKVConnectorStats | None:
-        """Get current connector stats for metrics exposure."""
-        # Calculate pending load blocks
-        pending_load_blocks = sum(
-            len(intent.block_ids) for intent in self._pending_load_intents.values()
-        )
+        """Get current connector stats for metrics exposure.
+
+        This method triggers SSDLoadTracker to update its internal state
+        (load level, bypass threshold) which will be used by should_bypass().
+        """
+        # Get stats from SSD tracker (this also updates its internal state)
+        ssd_stats = self._ssd_tracker.get_stats()
+        prefetch_durations, prefetch_blocks = self._ssd_tracker.get_prefetch_stats()
 
         stats = PegaKVConnectorStats(
             data={
-                "pending_load_requests": len(self._pending_load_intents),
-                "pending_load_blocks": pending_load_blocks,
-                "fallback_count": self._fallback_count,
+                "pending_prefetches": ssd_stats["pending_prefetches"],
+                "bypass_count": self._bypass_count,
+                # Prefetch histogram data (ms for duration)
+                "prefetch_duration": prefetch_durations,
+                "prefetch_blocks": prefetch_blocks,
             }
         )
 
-        # Reset fallback count after reporting (it's a counter)
-        self._fallback_count = 0
+        # Reset bypass count after reporting (it's a counter)
+        self._bypass_count = 0
 
         if stats.is_empty():
             return None

@@ -22,14 +22,20 @@ class PegaKVConnectorStats(KVConnectorStats):
 
     Metrics collected:
     - Scheduler-side (gauge):
-        - pending_load_requests: number of requests waiting for remote KV
-        - pending_load_blocks: total blocks waiting to be loaded
+        - pending_prefetches: number of requests waiting for SSD prefetch
     - Scheduler-side (counter):
-        - fallback_count: requests that bypassed cache lookup
-    - Worker-side (list for histogram):
+        - bypass_count: requests that bypassed cache lookup
+    - Scheduler-side (histogram):
+        - prefetch_duration: prefetch operation duration in milliseconds
+        - prefetch_blocks: number of blocks per prefetch operation
+    - Worker-side (histogram):
+        - load_duration: load operation duration in seconds
+        - load_blocks: number of blocks per load operation
         - save_duration: save operation duration in seconds
         - save_blocks: number of blocks per save operation
     - Worker-side (counter):
+        - load_success_count: successful load operations
+        - load_failure_count: failed load operations
         - save_success_count: successful save operations
         - save_failure_count: failed save operations
     """
@@ -41,10 +47,12 @@ class PegaKVConnectorStats(KVConnectorStats):
     def reset(self):
         self.data: dict = {
             # Scheduler-side gauges
-            "pending_load_requests": 0,
-            "pending_load_blocks": 0,
+            "pending_prefetches": 0,
             # Scheduler-side counters
-            "fallback_count": 0,
+            "bypass_count": 0,
+            # Scheduler-side prefetch histogram data
+            "prefetch_duration": [],  # list[float] in ms
+            "prefetch_blocks": [],  # list[int]
             # Worker-side lists (for histogram)
             "load_duration": [],
             "load_blocks": [],
@@ -77,12 +85,11 @@ class PegaKVConnectorStats(KVConnectorStats):
 
     def aggregate(self, other: "PegaKVConnectorStats") -> "PegaKVConnectorStats":
         # Gauge-like metrics: take the latest value
-        self.data["pending_load_requests"] = other.data.get("pending_load_requests", 0)
-        self.data["pending_load_blocks"] = other.data.get("pending_load_blocks", 0)
+        self.data["pending_prefetches"] = other.data.get("pending_prefetches", 0)
 
         # Counter-like metrics: sum them
         for key in [
-            "fallback_count",
+            "bypass_count",
             "load_success_count",
             "load_failure_count",
             "save_success_count",
@@ -91,7 +98,14 @@ class PegaKVConnectorStats(KVConnectorStats):
             self.data[key] = self.data.get(key, 0) + other.data.get(key, 0)
 
         # List metrics: extend
-        for key in ["load_duration", "load_blocks", "save_duration", "save_blocks"]:
+        for key in [
+            "prefetch_duration",
+            "prefetch_blocks",
+            "load_duration",
+            "load_blocks",
+            "save_duration",
+            "save_blocks",
+        ]:
             self_list = self.data.get(key, [])
             other_list = other.data.get(key, [])
             if isinstance(self_list, list) and isinstance(other_list, list):
@@ -100,15 +114,25 @@ class PegaKVConnectorStats(KVConnectorStats):
 
         return self
 
-    def reduce(self) -> dict[str, int | float]:
+    def reduce(self) -> dict[str, int | float | str]:
         """Reduce stats to summary values for logging."""
-        result: dict[str, int | float] = {
-            "pending_load_requests": self.data.get("pending_load_requests", 0),
-            "pending_load_blocks": self.data.get("pending_load_blocks", 0),
-            "fallback_count": self.data.get("fallback_count", 0),
+        result: dict[str, int | float | str] = {
+            "pending_prefetches": self.data.get("pending_prefetches", 0),
+            "bypass_count": self.data.get("bypass_count", 0),
         }
 
-        # Load stats
+        # Prefetch stats (scheduler-side)
+        prefetch_durations = self.data.get("prefetch_duration", [])
+        prefetch_blocks = self.data.get("prefetch_blocks", [])
+        num_prefetches = len(prefetch_durations)
+        if num_prefetches > 0:
+            result["num_prefetches"] = num_prefetches
+            # prefetch_duration is in ms, keep as ms for consistency
+            result["avg_prefetch_duration_ms"] = round(sum(prefetch_durations) / num_prefetches, 3)
+            result["total_prefetch_blocks"] = sum(prefetch_blocks)
+            result["avg_prefetch_blocks"] = round(sum(prefetch_blocks) / num_prefetches, 1)
+
+        # Load stats (worker-side)
         load_durations = self.data.get("load_duration", [])
         load_blocks = self.data.get("load_blocks", [])
         num_loads = len(load_durations)
@@ -120,7 +144,7 @@ class PegaKVConnectorStats(KVConnectorStats):
         result["load_success_count"] = self.data.get("load_success_count", 0)
         result["load_failure_count"] = self.data.get("load_failure_count", 0)
 
-        # Save stats
+        # Save stats (worker-side)
         save_durations = self.data.get("save_duration", [])
         save_blocks = self.data.get("save_blocks", [])
         num_saves = len(save_durations)
@@ -136,9 +160,9 @@ class PegaKVConnectorStats(KVConnectorStats):
 
     def is_empty(self) -> bool:
         return (
-            self.data.get("pending_load_requests", 0) == 0
-            and self.data.get("pending_load_blocks", 0) == 0
-            and self.data.get("fallback_count", 0) == 0
+            self.data.get("pending_prefetches", 0) == 0
+            and self.data.get("bypass_count", 0) == 0
+            and len(self.data.get("prefetch_duration", [])) == 0
             and len(self.data.get("load_duration", [])) == 0
             and self.data.get("load_success_count", 0) == 0
             and self.data.get("load_failure_count", 0) == 0
@@ -169,29 +193,42 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
 
         # Gauge metrics for scheduler-side state
-        gauge_pending_load_requests = self._gauge_cls(
-            name="vllm:pega_pending_load_requests",
-            documentation="Number of requests waiting for remote KV cache load.",
+        gauge_pending_prefetches = self._gauge_cls(
+            name="vllm:pega_pending_prefetches",
+            documentation="Number of requests waiting for SSD prefetch to complete.",
             labelnames=labelnames,
         )
-        self.gauge_pending_load_requests = self.make_per_engine(gauge_pending_load_requests)
+        self.gauge_pending_prefetches = self.make_per_engine(gauge_pending_prefetches)
 
-        gauge_pending_load_blocks = self._gauge_cls(
-            name="vllm:pega_pending_load_blocks",
-            documentation="Total blocks waiting to be loaded from remote KV cache.",
+        # Counter for bypass events
+        counter_bypass = self._counter_cls(
+            name="vllm:pega_bypass_total",
+            documentation="Number of requests that bypassed cache lookup due to SSD load.",
             labelnames=labelnames,
         )
-        self.gauge_pending_load_blocks = self.make_per_engine(gauge_pending_load_blocks)
+        self.counter_bypass = self.make_per_engine(counter_bypass)
 
-        # Counter for fallback events
-        counter_fallback = self._counter_cls(
-            name="vllm:pega_fallback_total",
-            documentation="Number of requests that bypassed cache lookup due to high pending loads.",
+        # Histogram for prefetch operations (scheduler-side)
+        # Using seconds for Prometheus convention (convert from ms in observe)
+        prefetch_buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+        histogram_prefetch_duration = self._histogram_cls(
+            name="vllm:pega_prefetch_duration_seconds",
+            documentation="Histogram of prefetch duration in seconds.",
+            buckets=prefetch_buckets,
             labelnames=labelnames,
         )
-        self.counter_fallback = self.make_per_engine(counter_fallback)
+        self.histogram_prefetch_duration = self.make_per_engine(histogram_prefetch_duration)
 
-        # Histogram for load operations
+        blocks_buckets = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+        histogram_prefetch_blocks = self._histogram_cls(
+            name="vllm:pega_prefetch_blocks",
+            documentation="Histogram of blocks per prefetch operation.",
+            buckets=blocks_buckets,
+            labelnames=labelnames,
+        )
+        self.histogram_prefetch_blocks = self.make_per_engine(histogram_prefetch_blocks)
+
+        # Histogram for load operations (worker-side)
         duration_buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
         histogram_load_duration = self._histogram_cls(
             name="vllm:pega_load_duration_seconds",
@@ -258,19 +295,23 @@ class PegaPromMetrics(KVConnectorPromMetrics):
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         """Record stats to Prometheus metrics."""
         # Gauge metrics
-        self.gauge_pending_load_requests[engine_idx].set(
-            transfer_stats_data.get("pending_load_requests", 0)
-        )
-        self.gauge_pending_load_blocks[engine_idx].set(
-            transfer_stats_data.get("pending_load_blocks", 0)
+        self.gauge_pending_prefetches[engine_idx].set(
+            transfer_stats_data.get("pending_prefetches", 0)
         )
 
-        # Counter: fallback
-        fallback_count = transfer_stats_data.get("fallback_count", 0)
-        if fallback_count > 0:
-            self.counter_fallback[engine_idx].inc(fallback_count)
+        # Counter: bypass
+        bypass_count = transfer_stats_data.get("bypass_count", 0)
+        if bypass_count > 0:
+            self.counter_bypass[engine_idx].inc(bypass_count)
 
-        # Histogram: load duration and blocks
+        # Histogram: prefetch duration and blocks (scheduler-side)
+        # prefetch_duration is in ms, convert to seconds for Prometheus
+        for duration_ms in transfer_stats_data.get("prefetch_duration", []):
+            self.histogram_prefetch_duration[engine_idx].observe(duration_ms / 1000.0)
+        for blocks in transfer_stats_data.get("prefetch_blocks", []):
+            self.histogram_prefetch_blocks[engine_idx].observe(blocks)
+
+        # Histogram: load duration and blocks (worker-side)
         for duration in transfer_stats_data.get("load_duration", []):
             self.histogram_load_duration[engine_idx].observe(duration)
         for blocks in transfer_stats_data.get("load_blocks", []):
