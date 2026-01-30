@@ -17,6 +17,7 @@ from pegaflow.connector.common import (
     PegaConnectorMetadata,
     PegaKVConnectorStats,
     logger,
+    parse_env_int,
 )
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 from pegaflow.pegaflow import PyLoadState
@@ -37,10 +38,16 @@ class SaveTask:
 class WorkerConnector:
     """Holds worker-only state and behaviors."""
 
+    # Maximum number of requests that can have pending saves simultaneously.
+    # NOTE: Read from PEGA_MAX_PENDING_SAVE_REQUESTS at module import time.
+    MAX_PENDING_SAVE_REQUESTS: int = parse_env_int("PEGA_MAX_PENDING_SAVE_REQUESTS", 10)
+
     def __init__(self, context: ConnectorContext):
         self._ctx = context
 
         self._save_queue = queue.Queue()
+        self._dropped_save_reqs: set[str] = set()  # Requests dropped due to save limit
+        self._save_dropped_count: int = 0  # Counter for metrics
         self._save_thread = threading.Thread(
             target=self._save_worker, daemon=True, name="PegaSaveWorker"
         )
@@ -323,27 +330,67 @@ class WorkerConnector:
 
         with self._save_completion_lock:
             for req_id in request_ids:
+                # Skip already-dropped requests
+                if req_id in self._dropped_save_reqs:
+                    continue
+
                 if req_id not in self._req_pending_layers:
+                    # New request - check if we're at capacity
+                    if len(self._req_pending_layers) >= self.MAX_PENDING_SAVE_REQUESTS:
+                        # At capacity, drop this request
+                        self._dropped_save_reqs.add(req_id)
+                        self._save_dropped_count += 1
+                        logger.warning(
+                            "[PegaKVConnector] Save limit reached (%d/%d), dropping req=%s",
+                            len(self._req_pending_layers),
+                            self.MAX_PENDING_SAVE_REQUESTS,
+                            req_id,
+                        )
+                        continue
+
+                    # Capacity available, initialize tracking
                     self._req_pending_layers[req_id] = len(self._registered_layers)
                     self._save_completion_events[req_id] = threading.Event()
+
+            # Filter to only active (non-dropped) requests
+            active_request_ids = [
+                r for r in request_ids if r not in self._dropped_save_reqs
+            ]
+
+        if not active_request_ids:
+            return
 
         self._save_queue.put(
             SaveTask(
                 layer_name=layer_name,
                 attn_metadata=attn_metadata,
                 metadata=metadata,
-                request_ids=request_ids,
+                request_ids=active_request_ids,
             )
         )
 
     def wait_for_save(self) -> None:
         skipped_requests: set[str] = set()
+        dropped_requests: set[str] = set()
 
         with self._save_completion_lock:
             pending_layers = set(self._req_pending_layers.keys())
             skipped_requests = self._current_save_intents - pending_layers
+
+            # Identify dropped requests in current save intents
+            dropped_requests = self._current_save_intents & self._dropped_save_reqs
+            # Remove non-dropped skipped requests
+            skipped_requests -= dropped_requests
+
             if skipped_requests:
                 self._completed_saves.update(skipped_requests)
+
+            # Mark dropped requests as completed so they can be properly cleaned up
+            if dropped_requests:
+                self._completed_saves.update(dropped_requests)
+
+            # Clean up dropped requests from tracking
+            self._dropped_save_reqs -= dropped_requests
 
             self._current_save_intents = set()
 
@@ -361,6 +408,13 @@ class WorkerConnector:
                 skipped_requests,
             )
             self._handle_save_completion(skipped_requests, reason="CUDA graph skip")
+
+        if dropped_requests:
+            logger.debug(
+                "[PegaKVConnector] Cleaned up %d dropped save requests: %s",
+                len(dropped_requests),
+                dropped_requests,
+            )
 
     def _save_worker(self) -> None:
         logger.info("[PegaKVConnector] Save worker thread started")
@@ -529,6 +583,15 @@ class WorkerConnector:
     def get_stats(self) -> PegaKVConnectorStats | None:
         """Get and reset worker stats for the current interval."""
         with self._stats_lock:
+            # Add current queue depth as gauge
+            with self._save_completion_lock:
+                self._stats.data["pending_save_requests"] = len(self._req_pending_layers)
+
+            # Add save_dropped_count to stats
+            if self._save_dropped_count > 0:
+                self._stats.data["save_dropped_count"] = self._save_dropped_count
+                self._save_dropped_count = 0
+
             if self._stats.is_empty():
                 return None
             return self._stats.clone_and_reset()

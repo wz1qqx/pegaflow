@@ -16,6 +16,25 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+def _percentile(data: list[float], p: float) -> float:
+    """Calculate percentile from a sorted list.
+
+    Args:
+        data: List of values (will be sorted in place).
+        p: Percentile value between 0 and 100.
+
+    Returns:
+        The percentile value, or 0.0 if data is empty.
+    """
+    if not data:
+        return 0.0
+    data.sort()
+    k = (len(data) - 1) * p / 100.0
+    f = int(k)
+    c = f + 1 if f + 1 < len(data) else f
+    return data[f] + (data[c] - data[f]) * (k - f)
+
+
 class PrefetchTracker:
     """Track prefetch queue depth, duration and blocks for metrics.
 
@@ -75,6 +94,8 @@ class PegaKVConnectorStats(KVConnectorStats):
     Metrics collected:
     - Scheduler-side (gauge):
         - pending_prefetches: number of requests waiting for SSD prefetch
+    - Scheduler-side (counter):
+        - bypass_count: requests that bypassed cache lookup
     - Scheduler-side (histogram):
         - prefetch_duration: prefetch operation duration in milliseconds
         - prefetch_blocks: number of blocks per prefetch operation
@@ -88,6 +109,7 @@ class PegaKVConnectorStats(KVConnectorStats):
         - load_failure_count: failed load operations
         - save_success_count: successful save operations
         - save_failure_count: failed save operations
+        - save_dropped_count: save operations dropped due to queue limit
     """
 
     def __post_init__(self):
@@ -98,9 +120,13 @@ class PegaKVConnectorStats(KVConnectorStats):
         self.data: dict = {
             # Scheduler-side gauges
             "pending_prefetches": 0,
+            # Scheduler-side counters
+            "bypass_count": 0,
             # Scheduler-side prefetch histogram data
             "prefetch_duration": [],  # list[float] in ms
             "prefetch_blocks": [],  # list[int]
+            # Worker-side gauges
+            "pending_save_requests": 0,
             # Worker-side lists (for histogram)
             "load_duration": [],
             "load_blocks": [],
@@ -111,6 +137,7 @@ class PegaKVConnectorStats(KVConnectorStats):
             "load_failure_count": 0,
             "save_success_count": 0,
             "save_failure_count": 0,
+            "save_dropped_count": 0,
         }
 
     def record_load(self, duration_seconds: float, num_blocks: int, success: bool):
@@ -134,13 +161,16 @@ class PegaKVConnectorStats(KVConnectorStats):
     def aggregate(self, other: "PegaKVConnectorStats") -> "PegaKVConnectorStats":
         # Gauge-like metrics: take the latest value
         self.data["pending_prefetches"] = other.data.get("pending_prefetches", 0)
+        self.data["pending_save_requests"] = other.data.get("pending_save_requests", 0)
 
         # Counter-like metrics: sum them
         for key in [
+            "bypass_count",
             "load_success_count",
             "load_failure_count",
             "save_success_count",
             "save_failure_count",
+            "save_dropped_count",
         ]:
             self.data[key] = self.data.get(key, 0) + other.data.get(key, 0)
 
@@ -165,6 +195,8 @@ class PegaKVConnectorStats(KVConnectorStats):
         """Reduce stats to summary values for logging."""
         result: dict[str, int | float | str] = {
             "pending_prefetches": self.data.get("pending_prefetches", 0),
+            "pending_save_requests": self.data.get("pending_save_requests", 0),
+            "bypass_count": self.data.get("bypass_count", 0),
         }
 
         # Prefetch stats (scheduler-side)
@@ -203,12 +235,14 @@ class PegaKVConnectorStats(KVConnectorStats):
             result["avg_save_blocks"] = round(sum(save_blocks) / num_saves, 1)
         result["save_success_count"] = self.data.get("save_success_count", 0)
         result["save_failure_count"] = self.data.get("save_failure_count", 0)
+        result["save_dropped_count"] = self.data.get("save_dropped_count", 0)
 
         return result
 
     def is_empty(self) -> bool:
         return (
             self.data.get("pending_prefetches", 0) == 0
+            and self.data.get("bypass_count", 0) == 0
             and len(self.data.get("prefetch_duration", [])) == 0
             and len(self.data.get("load_duration", [])) == 0
             and self.data.get("load_success_count", 0) == 0
@@ -216,6 +250,7 @@ class PegaKVConnectorStats(KVConnectorStats):
             and len(self.data.get("save_duration", [])) == 0
             and self.data.get("save_success_count", 0) == 0
             and self.data.get("save_failure_count", 0) == 0
+            and self.data.get("save_dropped_count", 0) == 0
         )
 
     def clone_and_reset(self) -> "PegaKVConnectorStats":
@@ -247,9 +282,26 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         )
         self.gauge_pending_prefetches = self.make_per_engine(gauge_pending_prefetches)
 
+        # Gauge metrics for worker-side state
+        gauge_pending_save_requests = self._gauge_cls(
+            name="vllm:pega_pending_save_requests",
+            documentation="Number of requests with pending save operations.",
+            labelnames=labelnames,
+        )
+        self.gauge_pending_save_requests = self.make_per_engine(gauge_pending_save_requests)
+
+        # Counter for bypass events (scheduler-side)
+        counter_bypass = self._counter_cls(
+            name="vllm:pega_bypass_total",
+            documentation="Number of requests that bypassed cache lookup due to short request.",
+            labelnames=labelnames,
+        )
+        self.counter_bypass = self.make_per_engine(counter_bypass)
+
         # Histogram for prefetch operations (scheduler-side)
-        # Using seconds for Prometheus convention (convert from ms in observe)
-        prefetch_buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+        # Optimized for fast SSD: typical range 10-500ms
+        # Buckets: 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1000 ms
+        prefetch_buckets = [0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0]
         histogram_prefetch_duration = self._histogram_cls(
             name="vllm:pega_prefetch_duration_seconds",
             documentation="Histogram of prefetch duration in seconds.",
@@ -267,8 +319,32 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         )
         self.histogram_prefetch_blocks = self.make_per_engine(histogram_prefetch_blocks)
 
+        # Percentile gauges for prefetch duration
+        gauge_prefetch_p50 = self._gauge_cls(
+            name="vllm:pega_prefetch_duration_p50_seconds",
+            documentation="50th percentile of prefetch duration in seconds.",
+            labelnames=labelnames,
+        )
+        self.gauge_prefetch_p50 = self.make_per_engine(gauge_prefetch_p50)
+
+        gauge_prefetch_p95 = self._gauge_cls(
+            name="vllm:pega_prefetch_duration_p95_seconds",
+            documentation="95th percentile of prefetch duration in seconds.",
+            labelnames=labelnames,
+        )
+        self.gauge_prefetch_p95 = self.make_per_engine(gauge_prefetch_p95)
+
+        gauge_prefetch_p99 = self._gauge_cls(
+            name="vllm:pega_prefetch_duration_p99_seconds",
+            documentation="99th percentile of prefetch duration in seconds.",
+            labelnames=labelnames,
+        )
+        self.gauge_prefetch_p99 = self.make_per_engine(gauge_prefetch_p99)
+
         # Histogram for load operations (worker-side)
-        duration_buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+        # Optimized for fast SSD: typical range 1-50ms
+        # Buckets: 1, 2, 3, 5, 7.5, 10, 15, 20, 30, 50, 100 ms
+        duration_buckets = [0.001, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.1]
         histogram_load_duration = self._histogram_cls(
             name="vllm:pega_load_duration_seconds",
             documentation="Histogram of KV cache load duration in seconds.",
@@ -298,6 +374,28 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             labelnames=labelnames,
         )
         self.counter_load_failure = self.make_per_engine(counter_load_failure)
+
+        # Percentile gauges for load duration
+        gauge_load_p50 = self._gauge_cls(
+            name="vllm:pega_load_duration_p50_seconds",
+            documentation="50th percentile of load duration in seconds.",
+            labelnames=labelnames,
+        )
+        self.gauge_load_p50 = self.make_per_engine(gauge_load_p50)
+
+        gauge_load_p95 = self._gauge_cls(
+            name="vllm:pega_load_duration_p95_seconds",
+            documentation="95th percentile of load duration in seconds.",
+            labelnames=labelnames,
+        )
+        self.gauge_load_p95 = self.make_per_engine(gauge_load_p95)
+
+        gauge_load_p99 = self._gauge_cls(
+            name="vllm:pega_load_duration_p99_seconds",
+            documentation="99th percentile of load duration in seconds.",
+            labelnames=labelnames,
+        )
+        self.gauge_load_p99 = self.make_per_engine(gauge_load_p99)
 
         # Histogram for save operations
         histogram_save_duration = self._histogram_cls(
@@ -330,25 +428,79 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         )
         self.counter_save_failure = self.make_per_engine(counter_save_failure)
 
+        counter_save_dropped = self._counter_cls(
+            name="vllm:pega_save_dropped_total",
+            documentation="Number of save operations dropped due to queue limit.",
+            labelnames=labelnames,
+        )
+        self.counter_save_dropped = self.make_per_engine(counter_save_dropped)
+
+        # Percentile gauges for save duration
+        gauge_save_p50 = self._gauge_cls(
+            name="vllm:pega_save_duration_p50_seconds",
+            documentation="50th percentile of save duration in seconds.",
+            labelnames=labelnames,
+        )
+        self.gauge_save_p50 = self.make_per_engine(gauge_save_p50)
+
+        gauge_save_p95 = self._gauge_cls(
+            name="vllm:pega_save_duration_p95_seconds",
+            documentation="95th percentile of save duration in seconds.",
+            labelnames=labelnames,
+        )
+        self.gauge_save_p95 = self.make_per_engine(gauge_save_p95)
+
+        gauge_save_p99 = self._gauge_cls(
+            name="vllm:pega_save_duration_p99_seconds",
+            documentation="99th percentile of save duration in seconds.",
+            labelnames=labelnames,
+        )
+        self.gauge_save_p99 = self.make_per_engine(gauge_save_p99)
+
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         """Record stats to Prometheus metrics."""
-        # Gauge metrics
+        # Gauge metrics (scheduler-side)
         self.gauge_pending_prefetches[engine_idx].set(
             transfer_stats_data.get("pending_prefetches", 0)
         )
 
-        # Histogram: prefetch duration and blocks (scheduler-side)
+        # Gauge metrics (worker-side)
+        self.gauge_pending_save_requests[engine_idx].set(
+            transfer_stats_data.get("pending_save_requests", 0)
+        )
+
+        # Counter: bypass (scheduler-side)
+        bypass_count = transfer_stats_data.get("bypass_count", 0)
+        if bypass_count > 0:
+            self.counter_bypass[engine_idx].inc(bypass_count)
+
+        # Histogram + Percentiles: prefetch duration (scheduler-side)
         # prefetch_duration is in ms, convert to seconds for Prometheus
-        for duration_ms in transfer_stats_data.get("prefetch_duration", []):
+        prefetch_durations = transfer_stats_data.get("prefetch_duration", [])
+        for duration_ms in prefetch_durations:
             self.histogram_prefetch_duration[engine_idx].observe(duration_ms / 1000.0)
         for blocks in transfer_stats_data.get("prefetch_blocks", []):
             self.histogram_prefetch_blocks[engine_idx].observe(blocks)
 
-        # Histogram: load duration and blocks (worker-side)
-        for duration in transfer_stats_data.get("load_duration", []):
+        # Calculate and set prefetch percentiles (convert ms to seconds)
+        if prefetch_durations:
+            prefetch_secs = [d / 1000.0 for d in prefetch_durations]
+            self.gauge_prefetch_p50[engine_idx].set(_percentile(prefetch_secs, 50))
+            self.gauge_prefetch_p95[engine_idx].set(_percentile(prefetch_secs, 95))
+            self.gauge_prefetch_p99[engine_idx].set(_percentile(prefetch_secs, 99))
+
+        # Histogram + Percentiles: load duration (worker-side)
+        load_durations = transfer_stats_data.get("load_duration", [])
+        for duration in load_durations:
             self.histogram_load_duration[engine_idx].observe(duration)
         for blocks in transfer_stats_data.get("load_blocks", []):
             self.histogram_load_blocks[engine_idx].observe(blocks)
+
+        # Calculate and set load percentiles
+        if load_durations:
+            self.gauge_load_p50[engine_idx].set(_percentile(list(load_durations), 50))
+            self.gauge_load_p95[engine_idx].set(_percentile(list(load_durations), 95))
+            self.gauge_load_p99[engine_idx].set(_percentile(list(load_durations), 99))
 
         # Counter: load success/failure
         load_success = transfer_stats_data.get("load_success_count", 0)
@@ -358,19 +510,29 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         if load_failure > 0:
             self.counter_load_failure[engine_idx].inc(load_failure)
 
-        # Histogram: save duration and blocks
-        for duration in transfer_stats_data.get("save_duration", []):
+        # Histogram + Percentiles: save duration
+        save_durations = transfer_stats_data.get("save_duration", [])
+        for duration in save_durations:
             self.histogram_save_duration[engine_idx].observe(duration)
         for blocks in transfer_stats_data.get("save_blocks", []):
             self.histogram_save_blocks[engine_idx].observe(blocks)
 
-        # Counter: save success/failure
+        # Calculate and set save percentiles
+        if save_durations:
+            self.gauge_save_p50[engine_idx].set(_percentile(list(save_durations), 50))
+            self.gauge_save_p95[engine_idx].set(_percentile(list(save_durations), 95))
+            self.gauge_save_p99[engine_idx].set(_percentile(list(save_durations), 99))
+
+        # Counter: save success/failure/dropped
         save_success = transfer_stats_data.get("save_success_count", 0)
         if save_success > 0:
             self.counter_save_success[engine_idx].inc(save_success)
         save_failure = transfer_stats_data.get("save_failure_count", 0)
         if save_failure > 0:
             self.counter_save_failure[engine_idx].inc(save_failure)
+        save_dropped = transfer_stats_data.get("save_dropped_count", 0)
+        if save_dropped > 0:
+            self.counter_save_dropped[engine_idx].inc(save_dropped)
 
 
 __all__ = [
