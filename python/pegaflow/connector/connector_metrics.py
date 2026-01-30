@@ -16,25 +16,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-def _percentile(data: list[float], p: float) -> float:
-    """Calculate percentile from a sorted list.
-
-    Args:
-        data: List of values (will be sorted in place).
-        p: Percentile value between 0 and 100.
-
-    Returns:
-        The percentile value, or 0.0 if data is empty.
-    """
-    if not data:
-        return 0.0
-    data.sort()
-    k = (len(data) - 1) * p / 100.0
-    f = int(k)
-    c = f + 1 if f + 1 < len(data) else f
-    return data[f] + (data[c] - data[f]) * (k - f)
-
-
 class PrefetchTracker:
     """Track prefetch queue depth, duration and blocks for metrics.
 
@@ -319,28 +300,6 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         )
         self.histogram_prefetch_blocks = self.make_per_engine(histogram_prefetch_blocks)
 
-        # Percentile gauges for prefetch duration
-        gauge_prefetch_p50 = self._gauge_cls(
-            name="vllm:pega_prefetch_duration_p50_seconds",
-            documentation="50th percentile of prefetch duration in seconds.",
-            labelnames=labelnames,
-        )
-        self.gauge_prefetch_p50 = self.make_per_engine(gauge_prefetch_p50)
-
-        gauge_prefetch_p95 = self._gauge_cls(
-            name="vllm:pega_prefetch_duration_p95_seconds",
-            documentation="95th percentile of prefetch duration in seconds.",
-            labelnames=labelnames,
-        )
-        self.gauge_prefetch_p95 = self.make_per_engine(gauge_prefetch_p95)
-
-        gauge_prefetch_p99 = self._gauge_cls(
-            name="vllm:pega_prefetch_duration_p99_seconds",
-            documentation="99th percentile of prefetch duration in seconds.",
-            labelnames=labelnames,
-        )
-        self.gauge_prefetch_p99 = self.make_per_engine(gauge_prefetch_p99)
-
         # Histogram for load operations (worker-side)
         # Optimized for fast SSD: typical range 1-50ms
         # Buckets: 1, 2, 3, 5, 7.5, 10, 15, 20, 30, 50, 100 ms
@@ -374,28 +333,6 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             labelnames=labelnames,
         )
         self.counter_load_failure = self.make_per_engine(counter_load_failure)
-
-        # Percentile gauges for load duration
-        gauge_load_p50 = self._gauge_cls(
-            name="vllm:pega_load_duration_p50_seconds",
-            documentation="50th percentile of load duration in seconds.",
-            labelnames=labelnames,
-        )
-        self.gauge_load_p50 = self.make_per_engine(gauge_load_p50)
-
-        gauge_load_p95 = self._gauge_cls(
-            name="vllm:pega_load_duration_p95_seconds",
-            documentation="95th percentile of load duration in seconds.",
-            labelnames=labelnames,
-        )
-        self.gauge_load_p95 = self.make_per_engine(gauge_load_p95)
-
-        gauge_load_p99 = self._gauge_cls(
-            name="vllm:pega_load_duration_p99_seconds",
-            documentation="99th percentile of load duration in seconds.",
-            labelnames=labelnames,
-        )
-        self.gauge_load_p99 = self.make_per_engine(gauge_load_p99)
 
         # Histogram for save operations
         histogram_save_duration = self._histogram_cls(
@@ -435,28 +372,6 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         )
         self.counter_save_dropped = self.make_per_engine(counter_save_dropped)
 
-        # Percentile gauges for save duration
-        gauge_save_p50 = self._gauge_cls(
-            name="vllm:pega_save_duration_p50_seconds",
-            documentation="50th percentile of save duration in seconds.",
-            labelnames=labelnames,
-        )
-        self.gauge_save_p50 = self.make_per_engine(gauge_save_p50)
-
-        gauge_save_p95 = self._gauge_cls(
-            name="vllm:pega_save_duration_p95_seconds",
-            documentation="95th percentile of save duration in seconds.",
-            labelnames=labelnames,
-        )
-        self.gauge_save_p95 = self.make_per_engine(gauge_save_p95)
-
-        gauge_save_p99 = self._gauge_cls(
-            name="vllm:pega_save_duration_p99_seconds",
-            documentation="99th percentile of save duration in seconds.",
-            labelnames=labelnames,
-        )
-        self.gauge_save_p99 = self.make_per_engine(gauge_save_p99)
-
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         """Record stats to Prometheus metrics."""
         # Gauge metrics (scheduler-side)
@@ -474,33 +389,18 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         if bypass_count > 0:
             self.counter_bypass[engine_idx].inc(bypass_count)
 
-        # Histogram + Percentiles: prefetch duration (scheduler-side)
+        # Histogram: prefetch duration (scheduler-side)
         # prefetch_duration is in ms, convert to seconds for Prometheus
-        prefetch_durations = transfer_stats_data.get("prefetch_duration", [])
-        for duration_ms in prefetch_durations:
+        for duration_ms in transfer_stats_data.get("prefetch_duration", []):
             self.histogram_prefetch_duration[engine_idx].observe(duration_ms / 1000.0)
         for blocks in transfer_stats_data.get("prefetch_blocks", []):
             self.histogram_prefetch_blocks[engine_idx].observe(blocks)
 
-        # Calculate and set prefetch percentiles (convert ms to seconds)
-        if prefetch_durations:
-            prefetch_secs = [d / 1000.0 for d in prefetch_durations]
-            self.gauge_prefetch_p50[engine_idx].set(_percentile(prefetch_secs, 50))
-            self.gauge_prefetch_p95[engine_idx].set(_percentile(prefetch_secs, 95))
-            self.gauge_prefetch_p99[engine_idx].set(_percentile(prefetch_secs, 99))
-
-        # Histogram + Percentiles: load duration (worker-side)
-        load_durations = transfer_stats_data.get("load_duration", [])
-        for duration in load_durations:
+        # Histogram: load duration (worker-side)
+        for duration in transfer_stats_data.get("load_duration", []):
             self.histogram_load_duration[engine_idx].observe(duration)
         for blocks in transfer_stats_data.get("load_blocks", []):
             self.histogram_load_blocks[engine_idx].observe(blocks)
-
-        # Calculate and set load percentiles
-        if load_durations:
-            self.gauge_load_p50[engine_idx].set(_percentile(list(load_durations), 50))
-            self.gauge_load_p95[engine_idx].set(_percentile(list(load_durations), 95))
-            self.gauge_load_p99[engine_idx].set(_percentile(list(load_durations), 99))
 
         # Counter: load success/failure
         load_success = transfer_stats_data.get("load_success_count", 0)
@@ -510,18 +410,11 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         if load_failure > 0:
             self.counter_load_failure[engine_idx].inc(load_failure)
 
-        # Histogram + Percentiles: save duration
-        save_durations = transfer_stats_data.get("save_duration", [])
-        for duration in save_durations:
+        # Histogram: save duration
+        for duration in transfer_stats_data.get("save_duration", []):
             self.histogram_save_duration[engine_idx].observe(duration)
         for blocks in transfer_stats_data.get("save_blocks", []):
             self.histogram_save_blocks[engine_idx].observe(blocks)
-
-        # Calculate and set save percentiles
-        if save_durations:
-            self.gauge_save_p50[engine_idx].set(_percentile(list(save_durations), 50))
-            self.gauge_save_p95[engine_idx].set(_percentile(list(save_durations), 95))
-            self.gauge_save_p99[engine_idx].set(_percentile(list(save_durations), 99))
 
         # Counter: save success/failure/dropped
         save_success = transfer_stats_data.get("save_success_count", 0)
