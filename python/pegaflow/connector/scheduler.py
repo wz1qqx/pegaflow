@@ -33,6 +33,10 @@ class SchedulerConnector:
     BYPASS_BLOCKS: int = parse_env_int("PEGA_BYPASS_BLOCKS", 8)
     HIGH_LOAD_THRESHOLD: int = parse_env_int("PEGA_HIGH_LOAD_THRESHOLD", 25)
 
+    # Maximum number of requests that can have pending saves simultaneously.
+    # When this limit is reached, new save intents will be dropped.
+    MAX_PENDING_SAVE_REQUESTS: int = parse_env_int("PEGA_MAX_PENDING_SAVE_REQUESTS", 10)
+
     def __init__(self, context: ConnectorContext):
         self._ctx = context
 
@@ -55,6 +59,9 @@ class SchedulerConnector:
         # Completion tracking
         self._pending_saves: set[str] = set()
         self._held_requests: set[str] = set()
+
+        # Save drop statistics (for metrics)
+        self._save_dropped_count: int = 0
 
     def get_num_new_matched_tokens(
         self,
@@ -151,7 +158,8 @@ class SchedulerConnector:
             )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
-        save_intents: dict[str, SaveIntent] = {}
+        # Collect potential save intents first, then apply drop decision
+        potential_saves: dict[str, SaveIntent] = {}
 
         load_intents = self._pending_load_intents
         self._pending_load_intents = {}
@@ -169,7 +177,7 @@ class SchedulerConnector:
             self._scheduled_tokens[req_id] += num_tokens
 
             if save_intent := self._consume_save_intent(req_id):
-                save_intents[req_id] = save_intent
+                potential_saves[req_id] = save_intent
 
         # Process cached (running) requests
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -186,15 +194,56 @@ class SchedulerConnector:
                 self._allocated_blocks[req_id].extend(new_block_ids[0])
 
             if save_intent := self._consume_save_intent(req_id):
-                save_intents[req_id] = save_intent
+                potential_saves[req_id] = save_intent
+
+        # Apply save limit: drop new save intents if pending saves exceed limit
+        # Priority: longer requests (more blocks) are kept, shorter ones are dropped
+        save_intents: dict[str, SaveIntent] = {}
+        current_pending = len(self._pending_saves)
+        available_slots = max(0, self.MAX_PENDING_SAVE_REQUESTS - current_pending)
+
+        # Separate continuing saves (already in pending) from new requests
+        continuing_saves: dict[str, SaveIntent] = {}
+        new_saves: list[tuple[str, SaveIntent, int]] = []  # (req_id, intent, block_count)
+
+        for req_id, intent in potential_saves.items():
+            if req_id in self._pending_saves:
+                # Continuing saves are always allowed
+                continuing_saves[req_id] = intent
+            else:
+                # New request - record its total block count for sorting
+                block_count = len(self._block_hashes.get(req_id, ()))
+                new_saves.append((req_id, intent, block_count))
+
+        # Sort new requests by block count (descending) - longer requests first
+        new_saves.sort(key=lambda x: x[2], reverse=True)
+
+        # Add all continuing saves
+        save_intents.update(continuing_saves)
+
+        # Add new saves up to available slots, prioritizing longer requests
+        for req_id, intent, block_count in new_saves:
+            if len(save_intents) - len(continuing_saves) < available_slots:
+                save_intents[req_id] = intent
+            else:
+                # Drop this save intent due to limit (shorter requests dropped first)
+                self._save_dropped_count += 1
+                logger.warning(
+                    "[PegaKVConnector] Save limit reached (%d/%d), dropping req=%s (blocks=%d)",
+                    current_pending,
+                    self.MAX_PENDING_SAVE_REQUESTS,
+                    req_id,
+                    block_count,
+                )
 
         # Track requests with pending saves
         self._pending_saves.update(save_intents.keys())
 
         logger.debug(
-            "[PegaKVConnector] build_connector_meta: %d loads, %d saves",
+            "[PegaKVConnector] build_connector_meta: %d loads, %d saves (dropped %d)",
             len(load_intents),
             len(save_intents),
+            len(potential_saves) - len(save_intents),
         )
 
         return PegaConnectorMetadata(
@@ -354,18 +403,22 @@ class SchedulerConnector:
         # Get stats from prefetch tracker
         prefetch_stats = self._prefetch_tracker.get_stats()
 
-        stats = PegaKVConnectorStats(
-            data={
-                "pending_prefetches": prefetch_stats["pending_prefetches"],
-                "bypass_count": self._bypass_count,
-                "prefetch_duration": prefetch_stats["prefetch_duration"],
-                "prefetch_blocks": prefetch_stats["prefetch_blocks"],
-            }
-        )
+        data: dict = {
+            "pending_prefetches": prefetch_stats["pending_prefetches"],
+            "bypass_count": self._bypass_count,
+            "prefetch_duration": prefetch_stats["prefetch_duration"],
+            "prefetch_blocks": prefetch_stats["prefetch_blocks"],
+        }
+
+        # Add save_dropped_count if there were any drops
+        if self._save_dropped_count > 0:
+            data["save_dropped_count"] = self._save_dropped_count
+            self._save_dropped_count = 0
 
         # Reset bypass count after reporting (it's a counter)
         self._bypass_count = 0
 
+        stats = PegaKVConnectorStats(data=data)
         if stats.is_empty():
             return None
         return stats
