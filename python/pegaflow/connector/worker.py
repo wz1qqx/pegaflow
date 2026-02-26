@@ -128,6 +128,10 @@ class WorkerConnector:
                 f"Invalid bytes_per_block for {layer_name}: stride={stride}"
             )
 
+            # Use actual number of registered layers, not model's num_hidden_layers
+            # This is important for models like DSA where indexer layers are separate
+            actual_num_layers = len(kv_caches)
+
             ok, message = self._ctx.engine_client.register_context(
                 self._ctx.instance_id,
                 self._ctx.namespace,
@@ -135,7 +139,7 @@ class WorkerConnector:
                 self._ctx.effective_tp_size,
                 self._ctx.world_size,
                 self._ctx.device_id,
-                self._ctx.num_layers,
+                actual_num_layers,
                 layer_name,
                 wrapper_bytes,
                 num_blocks,
