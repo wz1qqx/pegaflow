@@ -228,9 +228,12 @@ def should_exclude_from_transfer(layer_name: str, vllm_config) -> bool:
     """
     Check if a layer should be excluded from KV transfer.
 
-    Layers are excluded if they are:
-    1. Indexer layers (sparse attention's top-k selection, has CUDA Graph constraints)
-    2. MTP/draft layers (speculative decoding, KV contains potentially rejected tokens)
+    Only MTP/draft layers are excluded because their KV cache contains
+    potentially rejected speculative tokens.
+
+    Note: Indexer layers (sparse attention) are NOT excluded - they need
+    KV transfer support to ensure the connector receives complete KV data
+    for DeepSeek models with sparse attention.
 
     Args:
         layer_name: The attention layer name
@@ -239,10 +242,6 @@ def should_exclude_from_transfer(layer_name: str, vllm_config) -> bool:
     Returns:
         True if the layer should be excluded from KV transfer.
     """
-    # Always exclude indexer layers (CUDA Graph compatibility)
-    if is_indexer_layer(layer_name):
-        return True
-
     # Exclude MTP layers when speculative decoding is enabled
     if is_draft_layer(layer_name, vllm_config):
         return True
