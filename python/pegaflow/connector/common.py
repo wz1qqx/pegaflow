@@ -166,6 +166,48 @@ def detect_mla(vllm_config) -> bool:
     return getattr(hf_config, "kv_lora_rank", None) is not None
 
 
+def is_draft_layer(layer_name: str, vllm_config) -> bool:
+    """
+    Check if a layer is a draft/MTP layer that should be excluded from KV transfer.
+
+    MTP (Multi-Token Prediction) layers are additional layers beyond the target model's
+    hidden layers, used for speculative decoding. Their KV cache contains draft tokens
+    that may be rejected, so they should not be saved to or loaded from external storage.
+
+    Args:
+        layer_name: The attention layer name (e.g., "model.layers.78.self_attn.attn")
+        vllm_config: The vLLM configuration
+
+    Returns:
+        True if the layer is a MTP layer that should be excluded.
+    """
+    spec_config = vllm_config.speculative_config
+    if spec_config is None:
+        return False
+
+    # Check for MTP block pattern (some models use explicit mtp_block naming)
+    if "mtp_block" in layer_name:
+        return True
+
+    # Check layer index: MTP layers have index >= num_hidden_layers
+    # Layer names follow pattern: "model.layers.{idx}.self_attn.attn"
+    try:
+        parts = layer_name.split(".")
+        for i, part in enumerate(parts):
+            if part == "layers" and i + 1 < len(parts):
+                layer_idx = int(parts[i + 1])
+                num_hidden_layers = vllm_config.model_config.get_num_layers(
+                    vllm_config.parallel_config
+                )
+                if layer_idx >= num_hidden_layers:
+                    return True
+                break
+    except (ValueError, IndexError):
+        pass
+
+    return False
+
+
 __all__ = [
     "ConnectorContext",
     "LoadIntent",
@@ -175,6 +217,7 @@ __all__ = [
     "SaveIntent",
     "derive_namespace",
     "detect_mla",
+    "is_draft_layer",
     "logger",
     "parse_env_int",
     "resolve_instance_id",

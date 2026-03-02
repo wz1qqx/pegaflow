@@ -91,6 +91,14 @@ class WorkerConnector:
             "CUDA device id is unknown; cannot register KV caches"
         )
 
+        # Debug: log all layer names to identify extra layers (MTP, indexer, etc.)
+        layer_names = sorted(kv_caches.keys())
+        logger.info(
+            "[PegaKVConnector] KV cache layers to register (%d total): %s",
+            len(layer_names),
+            layer_names,
+        )
+
         self._registered_layers = list(kv_caches.keys())
         self._torch_device = next(iter(kv_caches.values())).device
 
@@ -263,9 +271,11 @@ class WorkerConnector:
         if not all_block_ids:
             return
 
+        # Only load for layers that were registered (excludes MTP layers)
+        registered_set = set(self._registered_layers)
         target_layers: list[str] = []
         for layer_name, layer in forward_context.no_compile_layers.items():
-            if hasattr(layer, "kv_cache"):
+            if hasattr(layer, "kv_cache") and layer_name in registered_set:
                 target_layers.append(layer_name)
 
         if not target_layers:

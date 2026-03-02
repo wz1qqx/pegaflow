@@ -22,6 +22,7 @@ from pegaflow.connector.common import (
     PegaPromMetrics,
     derive_namespace,
     detect_mla,
+    is_draft_layer,
     logger,
     resolve_instance_id,
 )
@@ -36,6 +37,8 @@ class PegaKVConnector(KVConnectorBase_V1):
 
     def __init__(self, vllm_config, role: KVConnectorRole):
         super().__init__(vllm_config, role)
+        self._vllm_config = vllm_config
+        self._draft_layer_names: set[str] = set()  # Populated during register_kv_caches
 
         instance_id = resolve_instance_id(vllm_config)
         tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -127,6 +130,9 @@ class PegaKVConnector(KVConnectorBase_V1):
     ) -> None:
         if not self._worker:
             return
+        # Skip MTP layers - they are not registered and should not be saved
+        if layer_name in self._draft_layer_names:
+            return
         metadata = self._get_connector_metadata()
         if metadata is None:
             return
@@ -145,7 +151,28 @@ class PegaKVConnector(KVConnectorBase_V1):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         if not self._worker:
             return
-        self._worker.register_kv_caches(kv_caches)
+
+        # Filter out MTP layers - they contain speculative draft tokens
+        # that may be rejected and should not be saved to external storage
+        self._draft_layer_names = {
+            name for name in kv_caches.keys()
+            if is_draft_layer(name, self._vllm_config)
+        }
+
+        if self._draft_layer_names:
+            logger.info(
+                "[PegaKVConnector] Excluding %d MTP layers from KV transfer: %s",
+                len(self._draft_layer_names),
+                sorted(self._draft_layer_names),
+            )
+            filtered_kv_caches = {
+                name: kv for name, kv in kv_caches.items()
+                if name not in self._draft_layer_names
+            }
+        else:
+            filtered_kv_caches = kv_caches
+
+        self._worker.register_kv_caches(filtered_kv_caches)
 
     def unregister_context(self) -> None:
         if self._worker:
