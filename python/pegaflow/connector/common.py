@@ -166,6 +166,23 @@ def detect_mla(vllm_config) -> bool:
     return getattr(hf_config, "kv_lora_rank", None) is not None
 
 
+def is_indexer_layer(layer_name: str) -> bool:
+    """
+    Check if a layer is an indexer layer used for sparse attention.
+
+    Indexer layers (DeepseekV32IndexerCache) are used for sparse attention's top-k
+    token selection. They have special CUDA Graph constraints and should be excluded
+    from KV transfer to avoid CPU-GPU synchronization issues during graph capture.
+
+    Args:
+        layer_name: The attention layer name (e.g., "model.layers.0.self_attn.indexer.attn")
+
+    Returns:
+        True if the layer is an indexer layer.
+    """
+    return "indexer" in layer_name
+
+
 def is_draft_layer(layer_name: str, vllm_config) -> bool:
     """
     Check if a layer is a draft/MTP layer that should be excluded from KV transfer.
@@ -208,6 +225,32 @@ def is_draft_layer(layer_name: str, vllm_config) -> bool:
     return False
 
 
+def should_exclude_from_transfer(layer_name: str, vllm_config) -> bool:
+    """
+    Check if a layer should be excluded from KV transfer.
+
+    Layers are excluded if they are:
+    1. Indexer layers (sparse attention's top-k selection, has CUDA Graph constraints)
+    2. MTP/draft layers (speculative decoding, KV contains potentially rejected tokens)
+
+    Args:
+        layer_name: The attention layer name
+        vllm_config: The vLLM configuration
+
+    Returns:
+        True if the layer should be excluded from KV transfer.
+    """
+    # Always exclude indexer layers (CUDA Graph compatibility)
+    if is_indexer_layer(layer_name):
+        return True
+
+    # Exclude MTP layers when speculative decoding is enabled
+    if is_draft_layer(layer_name, vllm_config):
+        return True
+
+    return False
+
+
 __all__ = [
     "ConnectorContext",
     "LoadIntent",
@@ -218,7 +261,9 @@ __all__ = [
     "derive_namespace",
     "detect_mla",
     "is_draft_layer",
+    "is_indexer_layer",
     "logger",
     "parse_env_int",
     "resolve_instance_id",
+    "should_exclude_from_transfer",
 ]

@@ -22,9 +22,9 @@ from pegaflow.connector.common import (
     PegaPromMetrics,
     derive_namespace,
     detect_mla,
-    is_draft_layer,
     logger,
     resolve_instance_id,
+    should_exclude_from_transfer,
 )
 from pegaflow.connector.scheduler import SchedulerConnector
 from pegaflow.connector.state_manager import ServiceStateManager
@@ -38,7 +38,7 @@ class PegaKVConnector(KVConnectorBase_V1):
     def __init__(self, vllm_config, role: KVConnectorRole):
         super().__init__(vllm_config, role)
         self._vllm_config = vllm_config
-        self._draft_layer_names: set[str] = set()  # Populated during register_kv_caches
+        self._excluded_layer_names: set[str] = set()  # Populated during register_kv_caches
 
         instance_id = resolve_instance_id(vllm_config)
         tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -116,8 +116,35 @@ class PegaKVConnector(KVConnectorBase_V1):
             return
         self._worker.start_load_kv(metadata, forward_context, **kwargs)
 
+    def should_transfer_layer(self, layer_name: str) -> bool:
+        """Check whether KV transfer should be performed for a given layer.
+
+        This is called by the @maybe_transfer_kv_layer decorator before
+        wait_for_layer_load and save_kv_layer. Returns False for:
+        1. Indexer layers (sparse attention's top-k selection)
+        2. MTP/draft layers (speculative decoding layers)
+
+        Args:
+            layer_name: The name of the layer to check.
+
+        Returns:
+            True if the layer should be transferred, False to skip.
+        """
+        # Use pre-computed exclusion set if available (populated in register_kv_caches)
+        if self._excluded_layer_names and layer_name in self._excluded_layer_names:
+            return False
+
+        # Fallback to dynamic check (for cases before register_kv_caches is called)
+        if should_exclude_from_transfer(layer_name, self._vllm_config):
+            return False
+
+        return True
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._worker:
+            return
+        # Skip excluded layers (MTP/indexer) - they are not registered for transfer
+        if layer_name in self._excluded_layer_names:
             return
         self._worker.wait_for_layer_load(layer_name)
 
@@ -130,8 +157,8 @@ class PegaKVConnector(KVConnectorBase_V1):
     ) -> None:
         if not self._worker:
             return
-        # Skip MTP layers - they are not registered and should not be saved
-        if layer_name in self._draft_layer_names:
+        # Skip excluded layers (MTP/indexer) - they are not registered and should not be saved
+        if layer_name in self._excluded_layer_names:
             return
         metadata = self._get_connector_metadata()
         if metadata is None:
@@ -152,22 +179,23 @@ class PegaKVConnector(KVConnectorBase_V1):
         if not self._worker:
             return
 
-        # Filter out MTP layers - they contain speculative draft tokens
-        # that may be rejected and should not be saved to external storage
-        self._draft_layer_names = {
+        # Filter out layers that should not participate in KV transfer:
+        # 1. MTP layers - contain speculative draft tokens that may be rejected
+        # 2. Indexer layers - sparse attention layers with CUDA Graph constraints
+        self._excluded_layer_names = {
             name for name in kv_caches.keys()
-            if is_draft_layer(name, self._vllm_config)
+            if should_exclude_from_transfer(name, self._vllm_config)
         }
 
-        if self._draft_layer_names:
+        if self._excluded_layer_names:
             logger.info(
-                "[PegaKVConnector] Excluding %d MTP layers from KV transfer: %s",
-                len(self._draft_layer_names),
-                sorted(self._draft_layer_names),
+                "[PegaKVConnector] Excluding %d layers from KV transfer: %s",
+                len(self._excluded_layer_names),
+                sorted(self._excluded_layer_names),
             )
             filtered_kv_caches = {
                 name: kv for name, kv in kv_caches.items()
-                if name not in self._draft_layer_names
+                if name not in self._excluded_layer_names
             }
         else:
             filtered_kv_caches = kv_caches
