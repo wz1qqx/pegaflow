@@ -213,9 +213,8 @@ def is_draft_layer(layer_name: str, vllm_config) -> bool:
         for i, part in enumerate(parts):
             if part == "layers" and i + 1 < len(parts):
                 layer_idx = int(parts[i + 1])
-                num_hidden_layers = vllm_config.model_config.get_num_layers(
-                    vllm_config.parallel_config
-                )
+                # Use total hidden layers (not per-PP-rank layers) for MTP detection
+                num_hidden_layers = vllm_config.model_config.get_total_num_hidden_layers()
                 if layer_idx >= num_hidden_layers:
                     return True
                 break
