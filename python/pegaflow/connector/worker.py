@@ -70,6 +70,9 @@ class WorkerConnector:
         self._stats = PegaKVConnectorStats()
         self._stats_lock = threading.Lock()
 
+        # Debug: track if start_load_kv was called in current forward
+        self._load_started_in_forward = False
+
     def shutdown(self) -> None:
         self.unregister_context()
         self._save_queue.put(None)
@@ -251,6 +254,13 @@ class WorkerConnector:
         forward_context: "ForwardContext",
         **kwargs: Any,
     ) -> None:
+        # Check for duplicate calls in same forward (may indicate MTP issue)
+        if self._load_started_in_forward:
+            logger.warning(
+                "[PegaKVConnector] start_load_kv called twice! (possible MTP issue)"
+            )
+        self._load_started_in_forward = True
+
         self._current_save_intents = set(metadata.save_intents.keys())
 
         if not metadata.load_intents:
@@ -333,7 +343,20 @@ class WorkerConnector:
     ) -> None:
         request_ids = list(metadata.save_intents.keys())
         if not request_ids:
+            logger.info(
+                "[PegaKVConnector] worker.save_kv_layer: layer=%s SKIP (no requests)",
+                layer_name,
+            )
             return
+
+        # Check if layer is registered
+        if layer_name not in self._layer_name_to_id:
+            logger.warning(
+                "[PegaKVConnector] worker.save_kv_layer: layer=%s NOT REGISTERED! "
+                "registered=%s",
+                layer_name,
+                list(self._layer_name_to_id.keys())[:5],  # First 5 for brevity
+            )
 
         with self._save_completion_lock:
             for req_id in request_ids:
@@ -352,6 +375,9 @@ class WorkerConnector:
         )
 
     def wait_for_save(self) -> None:
+        # Reset per-forward tracking
+        self._load_started_in_forward = False
+
         skipped_requests: set[str] = set()
 
         with self._save_completion_lock:

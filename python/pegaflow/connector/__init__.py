@@ -108,12 +108,35 @@ class PegaKVConnector(KVConnectorBase_V1):
     # ==============================
     # Worker-side methods
     # ==============================
+
+    def bind_connector_metadata(self, connector_metadata) -> None:
+        from vllm.forward_context import get_forward_context
+        try:
+            ctx = get_forward_context()
+            cg_mode = getattr(ctx, 'cudagraph_runtime_mode', 'N/A')
+        except Exception:
+            cg_mode = 'no_context'
+        logger.info(
+            "[PegaKVConnector] bind_metadata: loads=%d saves=%d cg_mode=%s",
+            len(getattr(connector_metadata, 'load_intents', {})),
+            len(getattr(connector_metadata, 'save_intents', {})),
+            cg_mode,
+        )
+        super().bind_connector_metadata(connector_metadata)
+
+    def clear_connector_metadata(self) -> None:
+        had_metadata = self._connector_metadata is not None
+        logger.info("[PegaKVConnector] clear_metadata: had=%s", had_metadata)
+        super().clear_connector_metadata()
+
     def start_load_kv(self, forward_context, **kwargs: Any) -> None:
         if not self._worker:
             return
         metadata = self._get_connector_metadata()
         if metadata is None:
             return
+        cg_mode = getattr(forward_context, 'cudagraph_runtime_mode', 'N/A')
+        logger.info("[PegaKVConnector] start_load_kv: cg_mode=%s", cg_mode)
         self._worker.start_load_kv(metadata, forward_context, **kwargs)
 
     def should_transfer_layer(self, layer_name: str) -> bool:
@@ -132,10 +155,18 @@ class PegaKVConnector(KVConnectorBase_V1):
         """
         # Use pre-computed exclusion set if available (populated in register_kv_caches)
         if self._excluded_layer_names and layer_name in self._excluded_layer_names:
+            logger.info(
+                "[PegaKVConnector] should_transfer_layer: layer=%s -> False (in excluded set)",
+                layer_name,
+            )
             return False
 
         # Fallback to dynamic check (for cases before register_kv_caches is called)
         if should_exclude_from_transfer(layer_name, self._vllm_config):
+            logger.info(
+                "[PegaKVConnector] should_transfer_layer: layer=%s -> False (dynamic check)",
+                layer_name,
+            )
             return False
 
         return True
@@ -157,12 +188,37 @@ class PegaKVConnector(KVConnectorBase_V1):
     ) -> None:
         if not self._worker:
             return
+
+        from vllm.forward_context import get_forward_context
+        try:
+            ctx = get_forward_context()
+            cg_mode = getattr(ctx, 'cudagraph_runtime_mode', 'N/A')
+        except Exception:
+            cg_mode = 'no_context'
+
         # Skip excluded layers (MTP/indexer) - they are not registered and should not be saved
         if layer_name in self._excluded_layer_names:
+            logger.info(
+                "[PegaKVConnector] save_kv_layer SKIP: layer=%s (excluded) cg_mode=%s",
+                layer_name, cg_mode,
+            )
             return
+
         metadata = self._get_connector_metadata()
         if metadata is None:
+            logger.info(
+                "[PegaKVConnector] save_kv_layer SKIP: layer=%s (no metadata) cg_mode=%s",
+                layer_name, cg_mode,
+            )
             return
+
+        logger.info(
+            "[PegaKVConnector] save_kv_layer: layer=%s kv_shape=%s saves=%d cg_mode=%s",
+            layer_name,
+            kv_layer.shape if kv_layer is not None else None,
+            len(metadata.save_intents),
+            cg_mode,
+        )
         self._worker.save_kv_layer(metadata, layer_name, kv_layer, attn_metadata, **kwargs)
 
     def wait_for_save(self) -> None:
